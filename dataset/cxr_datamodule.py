@@ -15,7 +15,11 @@ class CxrDataModule(pl.LightningDataModule):
     def __init__(self, datamodule_cfg, dataloader_init_args):
         super(CxrDataModule, self).__init__()
         self.cfg = datamodule_cfg
-        self.df = pd.read_csv(self.cfg["train_df_path"])
+        # self.df = pd.read_csv(self.cfg["train_df_path"])
+        self.train_df_path = self.cfg["train_df_path"]
+        self.val_df_path = self.cfg.get("val_df_path", None)
+        self.test_df_path = self.cfg.get("test_df_path", None)
+        self.pred_df_path = self.cfg.get("pred_df_path", None)
         self.dataloader_init_args = dataloader_init_args
         if self.cfg["use_pseudo_label"]:
             print("Using pseudo label")
@@ -26,13 +30,15 @@ class CxrDataModule(pl.LightningDataModule):
     def setup(self, stage):
         transforms_train, transforms_val = get_transforms(self.cfg["size"])
         if stage in ('fit', 'validate'):
-            # split train/val
-            msss = MultilabelStratifiedShuffleSplit(
-                n_splits=1, test_size=self.cfg["val_split"], random_state=self.cfg["seed"])
-            train_idx, val_idx = next(msss.split(
-                self.df, self.df[self.cfg["classes"]].values))
-            train_df = self.df.iloc[train_idx]
-            val_df = self.df.iloc[val_idx]
+            if self.val_df_path is not None and os.path.exists(self.val_df_path):
+                # 명시된 val.csv 사용
+                val_df = pd.read_csv(self.val_df_path)
+            else:
+                # 기존처럼 stratified split
+                msss = MultilabelStratifiedShuffleSplit(
+                    n_splits=1, test_size=self.cfg.get("val_split", 0.1), random_state=self.cfg["seed"])
+                train_idx, val_idx = next(msss.split(train_df, train_df[self.cfg["classes"]].values))
+                train_df, val_df = train_df.iloc[train_idx], train_df.iloc[val_idx]
 
             self.train_dataset = CxrStudyIdDataset(self.cfg, train_df, transforms_train)
             self.val_dataset = CxrStudyIdDataset(self.cfg, val_df, transforms_val)
@@ -49,7 +55,15 @@ class CxrDataModule(pl.LightningDataModule):
             print(f"train len: {len(self.train_dataset)}")
             print(f"val len: {len(self.val_dataset)}")
 
-        elif stage == 'predict':
+        # ───────────────── test ─────────────────
+        if stage == "test" or stage is None:
+            if self.test_df_path is not None and os.path.exists(self.test_df_path):
+                test_df = pd.read_csv(self.test_df_path)
+                self.test_dataset = CxrStudyIdDataset(self.cfg, test_df, transforms_val)
+            else:
+                self.test_dataset = None  # test 생략
+
+        if stage == 'predict':
             if self.cfg["predict_pseudo_label"] == "vinbig":
                 print("predicting with vinbig dataset")
                 pred_df = pd.read_csv(self.cfg["vinbig_train_df_path"])

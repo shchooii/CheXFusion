@@ -11,6 +11,11 @@ trainer:
         project: dongkyuk/CXR
         name: 384, tiny, baseline
         log_model_checkpoints: false
+    - class_path: lightning.pytorch.loggers.WandbLogger     # ← 추가
+      init_args:
+        project: CXR-LT
+        name: 384-tiny-baseline
+        tags: [ "cxr","fusion","mldecoder" ]
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
@@ -141,6 +146,8 @@ data:
     use_pseudo_label: false #true
     data_dir: data
     train_df_path: data/train.csv
+    val_df_path: data/val.csv
+    test_df_path: data/test.csv
     pred_df_path: data/development.csv
     vinbig_train_df_path: data/vinbig/train_processed.csv
     vinbig_pseudo_train_df_path: data/vinbig/train_processed_pseudo_labeled.csv
@@ -149,7 +156,7 @@ data:
     chexpert_train_df_path: data/chexpert/train_processed.csv
     chexpert_pseudo_train_df_path: data/chexpert/train_processed_pseudo_labeled.csv
     save_dir: save
-    val_split: 0.1
+    val_split: 0 # 수정
     seed: 42
     size: 1024
     classes: 
