@@ -5,24 +5,24 @@ trainer:
   devices: auto
   num_nodes: 1
   precision: 16-mixed
-  logger: 
-    - class_path: lightning.pytorch.loggers.NeptuneLogger
+  logger:
+    - class_path: lightning.pytorch.loggers.neptune.NeptuneLogger
       init_args:
-        project: dongkyuk/CXR
+        project: shchooii/hihi
         name: 384, tiny, baseline
         log_model_checkpoints: false
-    - class_path: lightning.pytorch.loggers.WandbLogger     # ← 추가
+    - class_path: lightning.pytorch.loggers.wandb.WandbLogger
       init_args:
         project: CXR-LT
         name: 384-tiny-baseline
-        tags: [ "cxr","fusion","mldecoder" ]
+        tags: [ "cxr", "fusion", "mldecoder" ]
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
         dirpath: save/transformer-fusion-padding-segembedding
         filename: '{epoch:02d}-{val_loss:.4f}-{val_ap:.5f}'
         save_top_k: 10
-        monitor: val_loss
+        monitor: val/loss
         mode: min
     # - class_path: callbacks.submit_callback.SubmissonWriter
     #   init_args:
@@ -35,11 +35,11 @@ trainer:
     - class_path: callbacks.fusion_submit_callback.FusionSubmissonWriter
       init_args:
           write_interval: epoch
-          sample_submission_path: data/sample_submission.csv
+          sample_submission_path: data/cxr-lt-2023/development_sample_submission.csv
           submission_path: save/submission.csv        
           submission_zip_path: save/submission.zip
           submission_code_dir: data/code      
-          pred_df_path: data/development.csv  
+          pred_df_path: data/cxr-lt-2023/development.csv  
     # - class_path: callbacks.vinbig_pseudo_callback.VinBigWriter
     #   init_args:
     #       write_interval: epoch
@@ -137,26 +137,25 @@ model:
     pretrained: true
 data:
   dataloader_init_args:
-    batch_size: 8
+    batch_size: 4 # 수정
     num_workers: 8            
     pin_memory: true
     persistent_workers: true
   datamodule_cfg: 
     predict_pseudo_label: null #chexpert
     use_pseudo_label: false #true
-    data_dir: data
-    train_df_path: data/train.csv
-    val_df_path: data/val.csv
-    test_df_path: data/test.csv
-    pred_df_path: data/development.csv
-    vinbig_train_df_path: data/vinbig/train_processed.csv
-    vinbig_pseudo_train_df_path: data/vinbig/train_processed_pseudo_labeled.csv
-    nih_train_df_path: data/nih/train_processed.csv
-    nih_pseudo_train_df_path: data/nih/train_processed_pseudo_labeled.csv
-    chexpert_train_df_path: data/chexpert/train_processed.csv
-    chexpert_pseudo_train_df_path: data/chexpert/train_processed_pseudo_labeled.csv
+    data_dir: /home/mixlab/tabular/shchoi/data/mimic-cxr-2.0.0/mimic-cxr-jpg-2.0.0.physionet.org
+    train_df_path: data/cxr-lt-2023/train.csv
+    test_df_path: data/cxr-lt-2023/test.csv
+    pred_df_path: data/cxr-lt-2023/development.csv
+    # vinbig_train_df_path: data/vinbig/train_processed.csv
+    # vinbig_pseudo_train_df_path: data/vinbig/train_processed_pseudo_labeled.csv
+    # nih_train_df_path: data/nih/train_processed.csv
+    # nih_pseudo_train_df_path: data/nih/train_processed_pseudo_labeled.csv
+    # chexpert_train_df_path: data/chexpert/train_processed.csv
+    # chexpert_pseudo_train_df_path: data/chexpert/train_processed_pseudo_labeled.csv
     save_dir: save
-    val_split: 0 # 수정
+    val_split: 0.1
     seed: 42
     size: 1024
     classes: 
@@ -187,4 +186,4 @@ data:
       - Support Devices
       - Tortuous Aorta
 
-ckpt_path: /home/paperspace/Desktop/CXR-LT/save/transformer-fusion-padding-segembedding/epoch=07-val_loss=0.0600-val_ap=0.36752.ckpt #/home/paperspace/Desktop/CXR-LT/save/transformer-fusion-padding-segembedding/epoch=06-val_loss=0.0600-val_ap=0.36612.ckpt #/home/paperspace/Desktop/CXR-LT/save/transformer-fusion-new/epoch=04-val_loss=0.0601-val_ap=0.36637.ckpt #/home/paperspace/Desktop/CXR-LT/save/pseudo-all-recent/epoch=05-val_loss=0.0594-val_ap=0.36696.ckpt #/home/paperspace/Desktop/CXR-LT/save/pseudo-all/epoch=06-val_loss=0.0597-val_ap=0.36819.ckpt #null #/home/paperspace/Desktop/CXR-LT/save/asl-mldecoder/epoch=06-val_loss=0.0600-val_ap=0.35800.ckpt #
+ckpt_path: null

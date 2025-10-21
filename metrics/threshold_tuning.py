@@ -34,6 +34,14 @@ def best_f1_per_class_sklearn(logits: torch.Tensor,
 
 
 def f1_score_db_tuning(logits, targets, groups, average="micro", type="single"):
+    
+    if isinstance(probs, torch.Tensor):
+        probs = probs.detach().float().cpu()
+    if isinstance(targets, torch.Tensor):
+        targets = targets.detach().float().cpu()
+    if groups is not None and isinstance(groups, torch.Tensor):
+        groups = groups.detach().long().cpu()
+           
     device, dtype = logits.device, logits.dtype
     if average not in ["micro", "macro"]:
         raise ValueError("Average must be either 'micro' or 'macro'")
@@ -75,7 +83,8 @@ def f1_score_db_tuning(logits, targets, groups, average="micro", type="single"):
         cls_f1 = tp / (tp + 0.5 * (fp + fn) + 1e-10)
         best_f1_g, best_db_g = {}, {}
         for g, idxs in groups.items():
-            idxs = torch.as_tensor(idxs, device=logits.device)
+            # idxs = torch.as_tensor(idxs, device=logits.device)
+            idxs = (groups == g).nonzero(as_tuple=False).squeeze(1)
             if average == "micro":
                 g_tp = tp[:, idxs].sum(1)
                 g_fp = fp[:, idxs].sum(1)

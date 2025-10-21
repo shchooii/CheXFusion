@@ -15,7 +15,7 @@ class CxrDataModule(pl.LightningDataModule):
     def __init__(self, datamodule_cfg, dataloader_init_args):
         super(CxrDataModule, self).__init__()
         self.cfg = datamodule_cfg
-        # self.df = pd.read_csv(self.cfg["train_df_path"])
+        self.df = pd.read_csv(self.cfg["train_df_path"])
         self.train_df_path = self.cfg["train_df_path"]
         self.val_df_path = self.cfg.get("val_df_path", None)
         self.test_df_path = self.cfg.get("test_df_path", None)
@@ -29,6 +29,7 @@ class CxrDataModule(pl.LightningDataModule):
 
     def setup(self, stage):
         transforms_train, transforms_val = get_transforms(self.cfg["size"])
+        train_df = self.df.copy()
         if stage in ('fit', 'validate'):
             if self.val_df_path is not None and os.path.exists(self.val_df_path):
                 # 명시된 val.csv 사용
@@ -40,8 +41,10 @@ class CxrDataModule(pl.LightningDataModule):
                 train_idx, val_idx = next(msss.split(train_df, train_df[self.cfg["classes"]].values))
                 train_df, val_df = train_df.iloc[train_idx], train_df.iloc[val_idx]
 
-            self.train_dataset = CxrStudyIdDataset(self.cfg, train_df, transforms_train)
-            self.val_dataset = CxrStudyIdDataset(self.cfg, val_df, transforms_val)
+            # self.train_dataset = CxrStudyIdDataset(self.cfg, train_df, transforms_train)
+            # self.val_dataset = CxrStudyIdDataset(self.cfg, val_df, transforms_val)
+            self.train_dataset = CxrDataset(self.cfg, train_df, transforms_train)
+            self.val_dataset   = CxrDataset(self.cfg, val_df,   transforms_val)
 
             if self.cfg["use_pseudo_label"]:
                 vin_dataset = VinDataset(self.cfg, self.vin_df, transforms_train)

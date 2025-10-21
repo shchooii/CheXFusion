@@ -37,10 +37,17 @@ class EpochBuffer:
         self._losses: List[torch.Tensor] = []
 
     def update_batch(self, logits: torch.Tensor, targets: torch.Tensor, loss: Optional[torch.Tensor] = None):
-        # MetricCollection은 확률/스코어를 logits로 받는다고 가정(너 코드에서 sigmoid 후 확률로 전달)
-        self.mc.update({"logits": logits.detach(), "targets": targets.detach(), "loss": (loss.detach().unsqueeze(0) if loss is not None else torch.tensor([0.0], device=logits.device))})
-        self._logits.append(logits.detach())
-        self._targets.append(targets.detach())
+        logits = logits.detach()
+        targets = targets.detach().to(logits.device)
+
+        loss_tensor = (loss.detach().unsqueeze(0) if loss is not None
+                    else torch.tensor([0.0], device=logits.device, dtype=logits.dtype))
+
+        # MetricCollection은 내부에서 다시 device 정리하지만, 일단 일관 유지
+        self.mc.update({"logits": logits, "targets": targets, "loss": loss_tensor})
+
+        self._logits.append(logits)
+        self._targets.append(targets)
         if loss is not None:
             self._losses.append(loss.detach())
 
@@ -68,9 +75,14 @@ class EpochBuffer:
         self._losses.clear()
         return out_float
 
+# utils/metrics_tracker.py
 def log_to_wandb(namespace: str, metrics: Dict[str, float], step: Optional[int] = None):
     if not metrics:
         return
-    # "val/f1_micro": 0.53 같은 느낌으로 네임스페이스 붙이기
     flat = {f"{namespace}/{k}": v for k, v in metrics.items()}
-    wandb.log(flat, step=step)
+    # step이 None이면 넘기지 않아 Lightning과 충돌 없음
+    if step is None:
+        wandb.log(flat)
+    else:
+        wandb.log(flat, step=step)
+

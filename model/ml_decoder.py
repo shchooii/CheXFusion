@@ -46,6 +46,8 @@ class TransformerDecoderLayerOptimal(nn.Module):
         self.norm3 = nn.LayerNorm(d_model, eps=layer_norm_eps)
 
         self.activation = _get_activation_fn(activation)
+        # 추가
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=False)
 
     def __setstate__(self, state):
         if 'activation' not in state:
@@ -55,7 +57,11 @@ class TransformerDecoderLayerOptimal(nn.Module):
     def forward(self, tgt: Tensor, memory: Tensor, tgt_mask: Optional[Tensor] = None,
                 memory_mask: Optional[Tensor] = None,
                 tgt_key_padding_mask: Optional[Tensor] = None,
-                memory_key_padding_mask: Optional[Tensor] = None) -> Tensor:
+                memory_key_padding_mask: Optional[Tensor] = None,
+                *, 
+                is_casual=None,
+                tgt_is_casual=None,
+                **kwargs) -> Tensor:
         tgt = tgt + self.dropout1(tgt)
         tgt = self.norm1(tgt)
         tgt2 = self.multihead_attn(tgt, memory, memory)[0]

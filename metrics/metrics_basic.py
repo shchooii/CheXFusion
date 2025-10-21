@@ -8,6 +8,10 @@ import math
 from typing import Any, Union
 
 
+def _to_device(x: torch.Tensor, device: str) -> torch.Tensor:
+    return x if (not isinstance(x, torch.Tensor)) or (x.device.type == device) else x.to(device)
+
+
 def detach(x: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
     """Detach a tensor from the computational graph"""
     if isinstance(x, torch.Tensor):
@@ -148,6 +152,11 @@ class MetricCollection:
                 self.best_metrics[metric.name] = metric_dict[metric.name]
 
     def update(self, batch: dict):
+        if "logits" in batch and isinstance(batch["logits"], torch.Tensor):
+            batch["logits"] = _to_device(batch["logits"], self.metrics[0].device)
+        if "targets" in batch and isinstance(batch["targets"], torch.Tensor):
+            batch["targets"] = _to_device(batch["targets"], self.metrics[0].device)
+
         for metric in self.metrics:
             if metric.batch_update and not metric.filter_codes:
                 metric.update(batch)
@@ -555,14 +564,29 @@ class PrecisionAtRecall(Metric):
     def update(self, batch: dict):
         logits, targets = detach(batch["logits"]), detach(batch["targets"])
         num_targets = targets.sum(dim=1, dtype=torch.int64)
+        
+        # 추가
+        has_pos = num_targets > 0
+        safe_num = torch.clamp(num_targets, min=1)
+        
         _, indices = torch.sort(logits, dim=1, descending=True)
         sorted_targets = targets.gather(1, indices)
         sorted_targets_cum = torch.cumsum(sorted_targets, dim=1)
-        self._precision_sum += torch.sum(
-            sorted_targets_cum.gather(1, num_targets.unsqueeze(1) - 1).squeeze()
-            / num_targets
-        )
+        
+        idx = (safe_num - 1).unsqueeze(1)                # shape: [B, 1], 안전 인덱스
+        topk_tp = sorted_targets_cum.gather(1, idx).squeeze(1)  # [B]
+
+        prec_each = torch.zeros_like(topk_tp, dtype=torch.float32)
+        prec_each[has_pos] = topk_tp[has_pos].float() / safe_num[has_pos].float()
+
+        self._precision_sum += prec_each.sum()
         self._num_examples += logits.size(0)
+        
+        # self._precision_sum += torch.sum(
+        #     sorted_targets_cum.gather(1, num_targets.unsqueeze(1) - 1).squeeze()
+        #     / num_targets
+        # )
+        # self._num_examples += logits.size(0)
 
     def compute(self) -> torch.Tensor:
         return self._precision_sum.cpu() / self._num_examples
@@ -635,9 +659,8 @@ class MeanAveragePrecision(Metric):
             batch_size, 1
         )
         prec_at_k = sorted_targets_cum / denom
-        average_precision_batch = torch.sum(
-            prec_at_k * sorted_targets, dim=1
-        ) / torch.sum(sorted_targets, dim=1)
+        denom_pos = torch.sum(sorted_targets, dim=1).clamp_min(1.0)
+        average_precision_batch = torch.sum(prec_at_k * sorted_targets, dim=1) / denom_pos
         self._average_precision_sum += torch.sum(average_precision_batch)
         self._num_examples += batch_size
 
