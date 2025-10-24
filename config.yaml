@@ -19,10 +19,10 @@ trainer:
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: save/transformer-fusion-padding-segembedding
+        dirpath: save/attempt01
         filename: '{epoch:02d}-{val_loss:.4f}-{val_ap:.5f}'
         save_top_k: 10
-        monitor: val/loss
+        monitor: val_loss
         mode: min
     # - class_path: callbacks.submit_callback.SubmissonWriter
     #   init_args:
@@ -55,14 +55,14 @@ trainer:
     #       write_interval: epoch
     #       chexpert_train_df_path: data/chexpert/train_processed.csv
     #       chexpert_pseudo_train_df_path: data/chexpert/train_processed_pseudo_labeled.csv
-    # - class_path: lightning.pytorch.callbacks.StochasticWeightAveraging
-    #   init_args:
-    #     swa_lrs: 1e-2
-    # - class_path: lightning.pytorch.callbacks.early_stopping.EarlyStopping
-    #   init_args:
-    #     monitor: val_ap
-    #     mode: max
-    #     patience: 10
+    - class_path: lightning.pytorch.callbacks.StochasticWeightAveraging
+      init_args:
+        swa_lrs: 1e-2
+    - class_path: lightning.pytorch.callbacks.early_stopping.EarlyStopping
+      init_args:
+        monitor: val_ap
+        mode: max
+        patience: 10
   fast_dev_run: false
   overfit_batches: 0.0
   val_check_interval: 0.25
