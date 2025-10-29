@@ -62,7 +62,8 @@ class CxrDataModule(pl.LightningDataModule):
         if stage == "test" or stage is None:
             if self.test_df_path is not None and os.path.exists(self.test_df_path):
                 test_df = pd.read_csv(self.test_df_path)
-                self.test_dataset = CxrStudyIdDataset(self.cfg, test_df, transforms_val)
+                # self.test_dataset = CxrStudyIdDataset(self.cfg, test_df, transforms_val)
+                self.test_dataset = CxrDataset(self.cfg, test_df, transforms_val)
             else:
                 self.test_dataset = None  # test 생략
 
@@ -91,3 +92,6 @@ class CxrDataModule(pl.LightningDataModule):
 
     def predict_dataloader(self):
         return DataLoader(self.pred_dataset, **self.dataloader_init_args, shuffle=False)
+    
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, **self.dataloader_init_args, shuffle=False)

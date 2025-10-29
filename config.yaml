@@ -19,7 +19,7 @@ trainer:
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: save/attempt04
+        dirpath: save/attempt11
         filename: '{epoch:02d}-{val_loss:.4f}-{val_ap:.5f}'
         save_top_k: 10
         monitor: val_loss
@@ -102,7 +102,7 @@ model:
   - Support Devices
   - Tortuous Aorta
   loss_init_args:
-    type: focal
+    type: wral
     class_instance_nums:
       - 67597
       - 4361
@@ -137,7 +137,7 @@ model:
     pretrained: true
 data:
   dataloader_init_args:
-    batch_size: 4 # 수정
+    batch_size: 8 # 수정
     num_workers: 8            
     pin_memory: true
     persistent_workers: true
