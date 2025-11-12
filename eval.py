@@ -7,6 +7,7 @@ from tqdm.auto import tqdm
 
 # ── 모델/데이터
 from model.cxr_model import CxrModel
+from model.cxr_model2 import CxrModel2
 from dataset.cxr_datamodule import CxrDataModule
 
 # ── metrics: mF1 계산은 기존 metrics.py 사용

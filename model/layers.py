@@ -20,16 +20,30 @@ class Backbone(nn.Module):
         x = self.pos_encoding(x)
         x = self.head(x)
         return x
+    
+    def forward_with_features(self, x):
+        """
+        Stage 1/2 공용: (logits, feature[=768-d]) 반환
+        """
+        feats = self.model(x)              # [B, 768, H, W]
+        pos   = self.pos_encoding(feats)
+        logits= self.head(pos)             # [B, 26]
+        fvec  = feats.mean(dim=[2, 3])     # [B, 768]  ← SLP 통계용
+        return logits, fvec
 
 
 class FusionBackbone(nn.Module):
     def __init__(self, timm_init_args, pretrained_path=None):
         super().__init__()
         self.model = timm.create_model(**timm_init_args)
-        self.model.head = MLDecoder(num_classes=26, initial_num_features=768)
-        if pretrained_path is not None:
-            self.model.load_state_dict(torch.load(pretrained_path))
+        
+        ## 추가
         self.model.head = nn.Identity()
+        if pretrained_path is not None:
+            state = torch.load(pretrained_path, map_location="cpu")
+            self.model.load_state_dict(state, strict=False)
+        
+        # self.model.head = nn.Identity()
         self.conv2d = nn.Conv2d(768, 768, kernel_size=3, stride=2, padding=1)
         self.pos_encoding = Summer(PositionalEncoding2D(768))
         self.padding_token = nn.Parameter(torch.randn(1, 768, 1, 1))

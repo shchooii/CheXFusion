@@ -2,6 +2,7 @@ import torch
 from lightning.pytorch.cli import LightningCLI
 from lightning.pytorch.loggers import NeptuneLogger
 from model.cxr_model import CxrModel
+from model.cxr_model2 import CxrModel2
 from dataset.cxr_datamodule import CxrDataModule
 
 class MyLightningCLI(LightningCLI):
@@ -11,7 +12,7 @@ class MyLightningCLI(LightningCLI):
 
 def cli_main():
     torch.set_float32_matmul_precision('high')
-    cli = MyLightningCLI(CxrModel, CxrDataModule, save_config_callback=None)
+    cli = MyLightningCLI(CxrModel2, CxrDataModule, save_config_callback=None)
 
 if __name__ == "__main__":
     cli_main()

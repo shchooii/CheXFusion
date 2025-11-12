@@ -4,6 +4,24 @@ import torch.nn.functional as F
 import numpy as np
 
 
+def _assert_finite(x, where):
+    if not torch.is_tensor(x):
+        raise AssertionError(f"[{where}] not a tensor: {type(x)}")
+    if not torch.isfinite(x).all():
+        _stats(where, x)
+        raise AssertionError(f"[NaN/Inf DETECTED] @ {where}")
+def _stats(name, t):
+    if not torch.is_tensor(t):
+        print(f"[{name}] not tensor: {type(t)}"); return
+    with torch.no_grad():
+        fin = torch.isfinite(t)
+        any_nan = (~fin).any().item()
+        mn = t[fin].min().item() if fin.any() else float('nan')
+        mx = t[fin].max().item() if fin.any() else float('nan')
+        mean = t[fin].mean().item() if fin.any() else float('nan')
+        print(f"[{name}] shape={tuple(t.shape)} min={mn:.3e} max={mx:.3e} mean={mean:.3e} any_nan={bool(any_nan)}")
+
+    
 def reduce_loss(loss, reduction):
     """Reduce loss as specified.
 
@@ -61,7 +79,7 @@ def _squeeze_binary_labels(label):
     return squeeze_label
 
 def cross_entropy(pred, label, weight=None, reduction='mean', avg_factor=None):
-
+    # element-wise losses
     if label.size(-1) != pred.size(0):
         label = _squeeze_binary_labels(label)
 
@@ -77,16 +95,8 @@ def cross_entropy(pred, label, weight=None, reduction='mean', avg_factor=None):
 
 
 def _expand_binary_labels(labels, label_weights, label_channels):
-    # label：shape为(n,)，对应的target类别标签，0 ~ num_class-1表示正样本对应的类别，num_class值表示负样本和忽略样本。
-    # label_channels(int)：等于num_classes
-
-    # 先构造大小和pred一致的全0张量
     bin_labels = labels.new_full((labels.size(0), label_channels), 0)
-    # 如果为非0，代表是需要one-hot
     inds = torch.nonzero(labels >= 1).squeeze()
-    # [2，
-    #  0
-    #  3] 得到的inds为0，2 然后bin_labels[0,2-1] [2,3-1]置1 实现one-hot
     if inds.numel() > 0:
         bin_labels[inds, labels[inds] - 1] = 1
     if label_weights is None:
@@ -94,8 +104,6 @@ def _expand_binary_labels(labels, label_weights, label_channels):
     else:
         bin_label_weights = label_weights.view(-1, 1).expand(
             label_weights.size(0), label_channels)
-    # .view(-1, 1)这里的 -1 表示在该维度上自动计算，以保持总元素数量不变，而 1 表示在新的维度上大小为 1。
-    # expand其目的是为了与标签数据的形状相匹配，并在每个标签通道上都有相同的标签权重值
     return bin_labels, bin_label_weights
 
 
@@ -106,12 +114,15 @@ def binary_cross_entropy(pred,
                          avg_factor=None):
     if pred.dim() != label.dim():
         label, weight = _expand_binary_labels(label, weight, pred.size(-1))
+
+    # weighted element-wise losses
     if weight is not None:
         weight = weight.float()
 
     loss = F.binary_cross_entropy_with_logits(
         pred, label.float(), weight, reduction='none')
     loss = weight_reduce_loss(loss, reduction=reduction, avg_factor=avg_factor)
+
     return loss
 
 
@@ -154,6 +165,7 @@ def kpos_cross_entropy(pred, label, weight=None, reduction='mean', avg_factor=No
         loss, weight=weight, reduction=reduction, avg_factor=avg_factor)
 
     return loss
+
 
 class CrossEntropyLoss(nn.Module):
 
@@ -225,36 +237,60 @@ def inverse_sigmoid(Y):
         X.append(x)
 
     return X
-def create_loss():
-    return CrossEntropyLoss(use_sigmoid=True)
 
-
+    
 class BCELosswithDiffLogits(nn.Module):
     def __init__(self):
         super(BCELosswithDiffLogits, self).__init__()
-        
-      
-    def forward(self, logits, targets, weight=None, reduction='none', avg_factor=None):
-        batch_size = logits.size(0)
-        num_classes = logits.size(1)
-        logits_array = logits.cpu().detach().numpy()
-        #txt_file = open("./test_slp_logits.txt")
-        #txt_file.write(logits_array)
-        #txt_file.write("\n")
-        logits = torch.sigmoid(logits)
-        targets = targets.view(batch_size,num_classes,1).expand(batch_size,num_classes,num_classes).clone()
-        if weight==None:
-            loss =  -  (targets * torch.log(logits) + \
-               (1 - targets) * torch.log(1 - logits))
-        else:
 
-            loss = - weight * (targets * torch.log(logits) + \
-               (1 - targets) * torch.log(1 - logits))
+    def forward(self, logits, targets, weight=None,
+                reduction='none', avg_factor=None):
+
+        _assert_finite(logits,  "bce.logits@input")
+        _assert_finite(targets, "bce.targets@input")
+
+        with torch.cuda.amp.autocast(enabled=False):
+            x = logits.float()
+            y = targets.float()
+
+            if x.dim() == 2:
+                # ---- 케이스 B: logits [B, C] → 그냥 BCE ----
+                p = torch.sigmoid(x).clamp(1e-6, 1-1e-6)  # 안정화
+                if weight is None:
+                    loss = - (y * torch.log(p) +
+                              (1 - y) * torch.log(1 - p))
+                else:
+                    w = weight.float()
+                    loss = - w * (y * torch.log(p) +
+                                  (1 - y) * torch.log(1 - p))
+
+            elif x.dim() == 3:
+                # ---- 케이스 A: logits [B, C, C] → SLP pairwise BCE ----
+                B, C, _ = x.shape
+                p = torch.sigmoid(x).clamp(1e-6, 1-1e-6)
+
+                y = y.view(B, C, 1).expand(B, C, C)
+
+                if weight is None:
+                    loss = - (y * torch.log(p) +
+                              (1 - y) * torch.log(1 - p))
+                else:
+                    # weight가 [B, C]면 같이 확장
+                    if weight.dim() == 2:
+                        w = weight.view(B, C, 1).expand(B, C, C).float()
+                    else:
+                        w = weight.float()
+                    loss = - w * (y * torch.log(p) +
+                                  (1 - y) * torch.log(1 - p))
+            else:
+                raise ValueError(f"BCELosswithDiffLogits: unexpected logits.dim()={x.dim()}")
+
+        _assert_finite(loss, "bce.loss@raw")
+
         if reduction == 'mean':
             loss = loss.mean()
         elif reduction == 'sum':
             loss = loss.sum()
-        elif reduction == 'none':
-            loss = loss
+        # 'none'이면 그대로
+
         return loss
-    
