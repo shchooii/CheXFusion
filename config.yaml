@@ -19,7 +19,7 @@ trainer:
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: save/attempt24
+        dirpath: save/stage0207
         filename: '{epoch:02d}-{val_loss:.4f}-{val_ap:.5f}'
         save_top_k: 10
         monitor: val_loss
@@ -67,7 +67,7 @@ trainer:
   overfit_batches: 0.0
   val_check_interval: 0.25
   num_sanity_val_steps: 2
-  accumulate_grad_batches: 1
+  accumulate_grad_batches: 2
   gradient_clip_val: null 
   deterministic: null
   benchmark: true
@@ -102,7 +102,7 @@ model:
   - Support Devices
   - Tortuous Aorta
   loss_init_args:
-    type: slp
+    type: wasl
     class_instance_nums:
       - 67597
       - 4361
@@ -137,10 +137,10 @@ model:
     pretrained: true
 data:
   dataloader_init_args:
-    batch_size: 4 # 수정
+    batch_size: 8
     num_workers: 8            
     pin_memory: true
-    persistent_workers: true
+    persistent_workers: true 
   datamodule_cfg: 
     predict_pseudo_label: null #chexpert
     use_pseudo_label: false #true
@@ -186,4 +186,5 @@ data:
       - Support Devices
       - Tortuous Aorta
 
-ckpt_path: null
+ckpt_path: save/attempt04/epoch=07-val_loss=1.2496-val_ap=0.34950.ckpt
+# save/baseline01/epoch=06-val_loss=0.0601-val_ap=0.35336.ckpt

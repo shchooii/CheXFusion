@@ -254,43 +254,49 @@ class BCELosswithDiffLogits(nn.Module):
             y = targets.float()
 
             if x.dim() == 2:
-                # ---- 케이스 B: logits [B, C] → 그냥 BCE ----
-                p = torch.sigmoid(x).clamp(1e-6, 1-1e-6)  # 안정화
+                # ---- Case B: [B, C] → 일반 BCE ----
+                p = torch.sigmoid(x).clamp(1e-6, 1-1e-6)
                 if weight is None:
                     loss = - (y * torch.log(p) +
-                              (1 - y) * torch.log(1 - p))
+                                (1 - y) * torch.log1p(-p))
                 else:
                     w = weight.float()
                     loss = - w * (y * torch.log(p) +
-                                  (1 - y) * torch.log(1 - p))
+                                    (1 - y) * torch.log1p(-p))
 
             elif x.dim() == 3:
-                # ---- 케이스 A: logits [B, C, C] → SLP pairwise BCE ----
+                # ---- Case A: [B, C, C] → SLP pairwise BCE ----
                 B, C, _ = x.shape
                 p = torch.sigmoid(x).clamp(1e-6, 1-1e-6)
 
+                # label [B,C] → [B,C,1] → [B,C,C]
                 y = y.view(B, C, 1).expand(B, C, C)
 
                 if weight is None:
                     loss = - (y * torch.log(p) +
-                              (1 - y) * torch.log(1 - p))
+                                (1 - y) * torch.log1p(-p))
                 else:
-                    # weight가 [B, C]면 같이 확장
+                    # weight [B,C]면 [B,C,1] → [B,C,C]로 확장
                     if weight.dim() == 2:
                         w = weight.view(B, C, 1).expand(B, C, C).float()
                     else:
                         w = weight.float()
                     loss = - w * (y * torch.log(p) +
-                                  (1 - y) * torch.log(1 - p))
+                                    (1 - y) * torch.log1p(-p))
+                # SLP 논문에서 subclass 방향으로 합/평균하는 역할
+                loss = loss.mean(dim=2)   # [B,C]
+
             else:
                 raise ValueError(f"BCELosswithDiffLogits: unexpected logits.dim()={x.dim()}")
 
         _assert_finite(loss, "bce.loss@raw")
 
-        if reduction == 'mean':
-            loss = loss.mean()
-        elif reduction == 'sum':
-            loss = loss.sum()
-        # 'none'이면 그대로
-
+        # avg_factor 있으면 수동 평균
+        if avg_factor is not None and reduction == 'mean':
+            loss = loss.sum() / (avg_factor + 1e-6)
+        else:
+            if reduction == 'mean':
+                loss = loss.mean()
+            elif reduction == 'sum':
+                loss = loss.sum()
         return loss

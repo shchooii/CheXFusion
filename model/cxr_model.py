@@ -12,7 +12,7 @@ class CxrModel(pl.LightningModule):
         super(CxrModel, self).__init__()
         self.lr = lr
         self.classes = classes
-        # self.backbone = FusionBackbone(timm_init_args, '/home/mixlab/tabular/shchoi/CheXFusion/export/backbone-stage1.pth')
+        # self.backbone = FusionBackbone(timm_init_args, 'export/convnext_stage1_for_fusion.pth')
         self.backbone = Backbone(timm_init_args)
         self.validation_step_outputs = []
         self.val_ap = AveragePrecision(task='binary')
@@ -79,6 +79,39 @@ class CxrModel(pl.LightningModule):
         pred_1 = self.shared_step(batch_1, batch_idx)['pred']
         pred = (pred + pred_1) / 2
         return pred
+    
+    def test_step(self, batch, batch_idx):
+        # validation과 거의 동일
+        res = self.shared_step(batch, batch_idx)
+        self.log_dict({'test_loss': res['loss'].detach()}, prog_bar=True)
+        # test용 버퍼에 따로 모으고 싶으면 새 리스트 사용
+        if not hasattr(self, "test_step_outputs"):
+            self.test_step_outputs = []
+        self.test_step_outputs.append(res)
+
+    def on_test_epoch_end(self):
+        preds = torch.cat([x['pred'] for x in self.test_step_outputs])
+        labels = torch.cat([x['label'] for x in self.test_step_outputs])
+
+        val_ap = []
+        val_auroc = []
+        for i in range(26):
+            ap = self.val_ap(preds[:, i], labels[:, i].long())
+            auroc = self.val_auc(preds[:, i], labels[:, i].long())
+            val_ap.append(ap)
+            val_auroc.append(auroc)
+            print(f'[TEST] {self.classes[i]}_ap: {ap}')
+
+        head_idx = [0, 2, 4, 12, 14, 16, 20, 24]
+        medium_idx = [1, 3, 5, 6, 8, 9, 10, 13, 15, 22]
+        tail_idx = [7, 11, 17, 18, 19, 21, 23, 25]
+
+        self.log_dict({'test_ap': sum(val_ap)/26}, prog_bar=True)
+        self.log_dict({'test_auroc': sum(val_auroc)/26}, prog_bar=True)
+        self.log_dict({'test_head_ap': sum([val_ap[i] for i in head_idx]) / len(head_idx)}, prog_bar=True)
+        self.log_dict({'test_medium_ap': sum([val_ap[i] for i in medium_idx]) / len(medium_idx)}, prog_bar=True)
+        self.log_dict({'test_tail_ap': sum([val_ap[i] for i in tail_idx]) / len(tail_idx)}, prog_bar=True)
+        self.test_step_outputs = []
 
     def configure_optimizers(self):
         optimizer = AdamW(self.backbone.parameters(), lr=self.lr)

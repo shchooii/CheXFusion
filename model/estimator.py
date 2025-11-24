@@ -19,88 +19,91 @@ class EstimatorCV():
 
     def update_CV(self, features, labels, logits):
         """
-        통계 업데이트 (그림/정의와 정합):
-        - Prop: p_i = n_i / N
-        - Cov_pos[i]: class i 양성(c=1) 집합에서의 logits 분산
-        - Cov_neg[i]: class i 음성(c=0) 집합에서의 logits 분산
-        - Sigma_cj[i,j]: i와 j가 동시에 1인 샘플들의 logits 분산
-        - Ro_cj[i,j]: |i∧j| / n_j
-        - Tao_cj[i,j]: (N - n_i) / (n_j - |i∧j|)
-        모든 행렬은 [C,C]로 만들고 루프 밖에서 min–max 정규화.
+        features : [N, A]
+        labels   : [N, C] (multi-hot)
+        logits   : [N, C]  ← 반드시 각 클래스 c의 축 s_c 로 계산에 사용
+        반환값   : Prop, Cov_pos, Cov_neg, Sigma_cj, Ro_cj, Tao_cj (전부 EMA 반영)
         """
         device = logits.device
         N = features.size(0)
         C = self.class_num
         A = features.size(1)
 
-        # ------- proportion p_i -------
         onehot = labels.to(device)
+
+        # ---------- Proportion p_c ----------
         pr_C = onehot.sum(0) / max(N, 1)
 
-        # ------- per-class variance (nonzero / zero) on logits -------
+        # ---------- σ_c^(+), σ_c^(-) : c-축(s_c) 분산만 ----------
         nonzero_var_list, zero_var_list = [], []
         for c in range(C):
-            pos_mask = (onehot[:, c] == 1)
-            neg_mask = ~pos_mask
+            pos = (onehot[:, c] == 1)
+            neg = ~pos
 
-            if pos_mask.sum() > 1:
-                nz = torch.var(logits[pos_mask, :], unbiased=False)
-                nz = torch.nan_to_num(nz, nan=0.0, posinf=0.0, neginf=0.0)
+            s_c_pos = logits[pos, c]      # s_c on positive subset
+            s_c_neg = logits[neg, c]      # s_c on negative subset
+
+            if s_c_pos.numel() > 1:
+                nz = torch.var(s_c_pos, unbiased=False)
             else:
                 nz = torch.tensor(0.0, device=device)
 
-            if neg_mask.sum() > 1:
-                zv = torch.var(logits[neg_mask, :], unbiased=False)
-                zv = torch.nan_to_num(zv, nan=0.0, posinf=0.0, neginf=0.0)
+            if s_c_neg.numel() > 1:
+                zv = torch.var(s_c_neg, unbiased=False)
             else:
                 zv = torch.tensor(0.0, device=device)
+
+            nz = torch.nan_to_num(nz, nan=0.0, posinf=0.0, neginf=0.0)
+            zv = torch.nan_to_num(zv, nan=0.0, posinf=0.0, neginf=0.0)
 
             nonzero_var_list.append(nz)
             zero_var_list.append(zv)
 
-        nonzero_var_tensor = torch.stack(nonzero_var_list, dim=0)  # [C]
-        zero_var_tensor    = torch.stack(zero_var_list,  dim=0)    # [C]
+        nonzero_var_tensor = torch.stack(nonzero_var_list)  # [C]
+        zero_var_tensor    = torch.stack(zero_var_list)     # [C]
 
-        # ------- co-occurrence matrices: sigma/rho/tau (C x C) -------
+        # ---------- σ_cj, ρ_cj, τ_cj : 항상 s_c 를 기준으로 ----------
         n_per_cls = onehot.sum(dim=0).to(torch.float32)  # [C]
-        sigma_rows, rho_rows, tau_rows = [], [], []
 
-        for i in range(C):
-            mi = (onehot[:, i] == 1)
-            ni = n_per_cls[i]
+        sigma_rows, rho_rows, tau_rows = [], [], []
+        for c in range(C):
+            pos_c = (onehot[:, c] == 1)
 
             sigma_j, rho_j, tau_j = [], [], []
             for j in range(C):
-                mj = (onehot[:, j] == 1)
-                nj = n_per_cls[j]
-                co_mask = (mi & mj)
-                co_cnt = co_mask.sum()
+                pos_j = (onehot[:, j] == 1)
+                co = (pos_c & pos_j)
+                co_cnt = co.sum()
 
-                # sigma_ij: 공출현 샘플 logits 분산 (없으면 0)
-                if co_cnt > 1:
-                    s_val = torch.var(logits[co_mask, :], unbiased=False)
+                # σ_cj: 공출현(co)에서 s_c 분산
+                if co_cnt.item() > 1:
+                    s_c_co = logits[co, c]  # **c축만**
+                    s_val = torch.var(s_c_co, unbiased=False)
                     s_val = torch.nan_to_num(s_val, nan=0.0, posinf=0.0, neginf=0.0)
                 else:
                     s_val = torch.tensor(0.0, device=device)
 
-                # rho_ij = |i∧j| / n_j
+                # ρ_cj = |c∧j| / n_j
+                nj = n_per_cls[j]
                 rho_val = (co_cnt.to(torch.float32)) / (nj + 1e-7)
-                # tao_ij = (N - n_i) / (n_j - |i∧j|)
-                tao_val = (N - ni) / (nj - co_cnt.to(torch.float32) + 1e-7)
+
+                # τ_cj = (N - n_c) / (n_j - |c∧j| + ε)
+                nc = n_per_cls[c]
+                tau_val = (N - nc) / (nj - co_cnt.to(torch.float32) + 1e-7)
 
                 sigma_j.append(s_val)
                 rho_j.append(torch.as_tensor(rho_val, device=device, dtype=torch.float32))
-                tau_j.append(torch.as_tensor(tao_val, device=device, dtype=torch.float32))
+                tau_j.append(torch.as_tensor(tau_val, device=device, dtype=torch.float32))
 
             sigma_rows.append(torch.stack(sigma_j))  # [C]
             rho_rows.append(torch.stack(rho_j))      # [C]
             tau_rows.append(torch.stack(tau_j))      # [C]
 
-        sigma_mat = torch.stack(sigma_rows, dim=0).to(device=device, dtype=torch.float32)  # [C,C]
-        rho_mat   = torch.stack(rho_rows,   dim=0).to(device=device, dtype=torch.float32)  # [C,C]
-        tau_mat   = torch.stack(tau_rows,   dim=0).to(device=device, dtype=torch.float32)  # [C,C]
+        sigma_mat = torch.stack(sigma_rows, dim=0)  # [C, C]
+        rho_mat   = torch.stack(rho_rows,   dim=0)  # [C, C]
+        tau_mat   = torch.stack(tau_rows,   dim=0)  # [C, C]
 
-        # ------- stable min–max normalization -------
+        # ---------- 안정적인 Min–Max 정규화 ----------
         def _minmax(x, eps=1e-6):
             xmin = x.min()
             xmax = x.max()
@@ -110,17 +113,17 @@ class EstimatorCV():
         normalized_ro_cj    = _minmax(rho_mat)
         normalized_tao_cj   = _minmax(tau_mat)
 
-        # ===== 기존 EMA 누적 로직(특징/공분산/평균) =====
+        # ---------- 아래는 기존 EMA 업데이트 로직(디바이스/NaN 가드 유지) ----------
         NxCxFeatures = features.view(N, 1, A).expand(N, C, A)
         NxCxA_onehot = onehot.view(N, C, 1).expand(N, C, A)
         features_by_sort = NxCxFeatures * NxCxA_onehot
 
-        Amount_CxA = NxCxA_onehot.sum(0)               # [C, A]
+        Amount_CxA = NxCxA_onehot.sum(0)  # [C, A]
         Amount_CxA[Amount_CxA == 0] = 1
-        ave_CxA = features_by_sort.sum(0) / Amount_CxA # [C, A]
 
+        ave_CxA = features_by_sort.sum(0) / Amount_CxA  # [C, A]
         var_temp = features_by_sort - ave_CxA.expand(N, C, A) * NxCxA_onehot
-        var_temp = torch.bmm(                                  # [C, A, A]
+        var_temp = torch.bmm(
             var_temp.permute(1, 2, 0),
             var_temp.permute(1, 0, 2)
         ) / Amount_CxA.view(C, A, 1).expand(C, A, A)
@@ -130,7 +133,7 @@ class EstimatorCV():
         sum_weight_CV     = onehot.sum(0).view(C, 1, 1).expand(C, A, A)
         sum_weight_AV     = onehot.sum(0).view(C, 1).expand(C, A)
 
-        # [C,C] co-occurrence count for EMA weight_CJ
+        # co-occurrence 수 기반 EMA weight_CJ
         sum_weight_CJ = torch.zeros(C, C, device=device)
         for i in range(C):
             for j in range(i, C):
@@ -142,45 +145,44 @@ class EstimatorCV():
                     sum_weight_CJ[i, j] = v
                     sum_weight_CJ[j, i] = v
 
-        # ------ EMA weights (with NaN guards) ------
-        weight_PR = sum_weight_PR / (sum_weight_PR + self.Amount.view(C))
+        # EMA 가중치들
+        def safe_div(num, den):
+            return num / (den + 1e-7)
+
+        weight_PR     = safe_div(sum_weight_PR,     sum_weight_PR     + self.Amount.view(C))
+        weight_PR_neg = safe_div(sum_weight_PR_neg, sum_weight_PR_neg + self.Amount.view(C))
+        weight_CV     = safe_div(sum_weight_CV,     sum_weight_CV     + self.Amount.view(C, 1, 1).expand(C, A, A))
+        weight_AV     = safe_div(sum_weight_AV,     sum_weight_AV     + self.Amount.view(C, 1).expand(C, A))
+        weight_CJ     = safe_div(sum_weight_CJ,     sum_weight_CJ     + self.Amount.view(C))
+
         weight_PR[weight_PR != weight_PR] = 0
-
-        weight_PR_neg = sum_weight_PR_neg / (sum_weight_PR_neg + self.Amount.view(C))
         weight_PR_neg[weight_PR_neg != weight_PR_neg] = 0
-
-        weight_CV = sum_weight_CV / (sum_weight_CV + self.Amount.view(C, 1, 1).expand(C, A, A))
         weight_CV[weight_CV != weight_CV] = 0
-
-        weight_AV = sum_weight_AV / (sum_weight_AV + self.Amount.view(C, 1).expand(C, A))
         weight_AV[weight_AV != weight_AV] = 0
-
-        weight_CJ = sum_weight_CJ / (sum_weight_CJ + self.Amount.view(C))
         weight_CJ[weight_CJ != weight_CJ] = 0
 
-        # ------ additional_CV (이전 로직 유지) ------
         additional_CV = weight_CV * (1 - weight_CV) * torch.bmm(
             (self.Ave - ave_CxA).view(C, A, 1),
             (self.Ave - ave_CxA).view(C, 1, A)
         )
 
-        # ------ EMA updates ------
-        self.Prop = (self.Prop * (1 - weight_PR) + pr_C * weight_PR).detach()
-        self.CoVariance = (self.CoVariance * (1 - weight_CV) + var_temp * weight_CV).detach() + additional_CV.detach()
-        self.Ave = (self.Ave * (1 - weight_AV) + ave_CxA * weight_AV).detach()
+        # EMA 업데이트
+        self.Prop       = (self.Prop      * (1 - weight_PR)     + pr_C              * weight_PR    ).detach()
+        self.CoVariance = (self.CoVariance* (1 - weight_CV)     + var_temp          * weight_CV    ).detach() + additional_CV.detach()
+        self.Ave        = (self.Ave       * (1 - weight_AV)     + ave_CxA           * weight_AV    ).detach()
 
-        self.Cov_pos = (self.Cov_pos * (1 - weight_PR) + nonzero_var_tensor * weight_PR).detach()
-        self.Cov_neg = (self.Cov_neg * (1 - weight_PR_neg) + zero_var_tensor * weight_PR_neg).detach()
+        self.Cov_pos    = (self.Cov_pos   * (1 - weight_PR)     + nonzero_var_tensor* weight_PR    ).detach()
+        self.Cov_neg    = (self.Cov_neg   * (1 - weight_PR_neg) + zero_var_tensor   * weight_PR_neg).detach()
 
-        # co-occurrence matrices (정규화된 값으로 EMA)
-        self.Sigma_cj = (self.Sigma_cj * (1 - weight_CJ) + normalized_sigma_cj * weight_CJ).detach()
-        self.Ro_cj    = (self.Ro_cj    * (1 - weight_CJ) + normalized_ro_cj    * weight_CJ).detach()
-        self.Tao_cj   = (self.Tao_cj   * (1 - weight_CJ) + normalized_tao_cj   * weight_CJ).detach()
+        self.Sigma_cj   = (self.Sigma_cj  * (1 - weight_CJ)     + normalized_sigma_cj*weight_CJ    ).detach()
+        self.Ro_cj      = (self.Ro_cj     * (1 - weight_CJ)     + normalized_ro_cj   *weight_CJ    ).detach()
+        self.Tao_cj     = (self.Tao_cj    * (1 - weight_CJ)     + normalized_tao_cj  *weight_CJ    ).detach()
 
-        # 샘플 수 누적
+        # 누적 샘플수
         self.Amount += onehot.sum(0)
 
         return self.Prop, self.Cov_pos, self.Cov_neg, self.Sigma_cj, self.Ro_cj, self.Tao_cj
+
 
     # def update_CV(self, features, labels, logits): #features 128,640; label:128 
 
