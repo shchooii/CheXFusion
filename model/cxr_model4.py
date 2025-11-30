@@ -3,23 +3,35 @@ import lightning.pytorch as pl
 from torch.optim import AdamW
 from torchmetrics import AveragePrecision, AUROC
 from transformers import get_cosine_schedule_with_warmup
-from model.layers import Backbone, FusionBackbone, Backbone3Head, FusionBackbone3Head
+from model.layers import FusionBackbone3Head
 from model.loss import get_loss
+from model.estimator import EstimatorCV
 import torch.nn as nn
 import torch.nn.functional as F
+
+def _assert_finite(t: torch.Tensor, name: str):
+    if not torch.isfinite(t.detach()).all():
+        bad = t.detach()
+        msg = (
+            f"[NaN/Inf DETECTED] {name} has non-finite values: "
+            f"min={bad.min().item() if bad.numel() else 'NA'}, "
+            f"max={bad.max().item() if bad.numel() else 'NA'}, "
+            f"any_nan={(~torch.isfinite(bad)).any().item()}"
+        )
+        raise AssertionError(msg)
 
 
 class HeadTailBalancerLoss(nn.Module):
     """
     head, tail, balance(logits) + labels를 받아서
-    외부에서 넘겨받은 loss(예: ASL)를 이용해 HTB 보조 loss를 계산.
+    외부에서 넘겨받은 loss(예: ASL, SLP)를 이용해 HTB 보조 loss를 계산.
     
     - loss는 "배치별 손실 벡터"를 반환하는 형태(reduction='none')여야
       k_h, k_t 가 샘플별로 잘 작동함.
     """
     def __init__(self, loss: nn.Module, gamma: float = 2.0, eps: float = 1e-8):
         super().__init__()
-        self.loss = loss      # 예: AsymmetricLoss, FocalLoss 등
+        self.loss = loss      # 예: AsymmetricLoss, ResampleLoss2(SLP) 등
         self.gamma = gamma
         self.eps = eps
 
@@ -27,14 +39,26 @@ class HeadTailBalancerLoss(nn.Module):
                 head: torch.Tensor,      # [B, C]
                 tail: torch.Tensor,      # [B, C]
                 balance: torch.Tensor,   # [B, C]
-                labels: torch.Tensor     # [B, C]
+                labels: torch.Tensor,    # [B, C]
+                slp_stats: tuple = None  # SLP 통계 (Prop, nonzero_var, ...)
                 ) -> torch.Tensor:
+
+        # Helper to call loss with correct arguments
+        def call_loss(logits, lbl):
+            if slp_stats is not None:
+                # SLP loss: (*stats, logits, labels, reduction_override='none')
+                return self.loss(*slp_stats, logits, lbl, reduction_override='none')
+            else:
+                # Standard loss: (logits, labels, reduction_override='none')
+                # 일부 loss는 reduction_override를 지원하지 않을 수 있으니 확인 필요하지만,
+                # get_loss로 가져오는 loss들은 대부분 지원함 (custom loss들).
+                # 만약 지원 안하면 reduction='none'으로 init 해야 함.
+                return self.loss(logits, lbl, reduction_override='none')
 
         # 1) head / tail 성능 기반 가중치 k_h, k_t 계산
         with torch.no_grad():
-            # loss(head, labels) → [B] 라고 가정 (reduction='none')
-            h_acc = self.loss(head, labels).pow(self.gamma)   # [B]
-            t_acc = self.loss(tail, labels).pow(self.gamma)   # [B]
+            h_acc = call_loss(head, labels).pow(self.gamma)   # [B]
+            t_acc = call_loss(tail, labels).pow(self.gamma)   # [B]
             denom = h_acc + t_acc + self.eps                  # [B]
             k_h = h_acc / denom                               # [B]
             k_t = t_acc / denom                               # [B]
@@ -45,22 +69,18 @@ class HeadTailBalancerLoss(nn.Module):
         p_b = F.softmax(balance, dim=-1)   # [B, C]
 
         # 3) head / tail 분포에 balance 분포를 엮어서 다시 loss 계산
-        #    loss는 (logits_or_prob, labels) → [B] 반환한다고 가정
-        loss_h = self.loss(p_h * p_b, labels)  # [B]
-        loss_t = self.loss(p_t * p_b, labels)  # [B]
+        #    SLP loss를 base로 쓸 때도 이 "확률곱"을 logits 위치에 넣어줌.
+        loss_h = call_loss(p_h * p_b, labels)  # [B]
+        loss_t = call_loss(p_t * p_b, labels)  # [B]
 
         # 4) 샘플별로 k_h, k_t 가중해서 평균
-        #    k_h, k_t: [B] → [B, 1]로 브로드캐스트
         loss = (k_h * loss_h + k_t * loss_t).mean()
         return loss
 
 
 class HTBAuxiliaryLoss(nn.Module):
     """
-    - 외부에서 받은 base_loss (예: ASL, ResampleLoss 등)를
-      HTB 내부에서도 그대로 사용.
-    - forward에서는 단순히 HeadTailBalancerLoss 한 번만 호출.
-    - main loss는 모델 쪽에서 base_loss(bal, labels)로 따로 계산.
+    - 외부에서 받은 base_loss (예: SLP)를 HTB 내부에서도 그대로 사용.
     """
     def __init__(self, base_loss: nn.Module, gamma: float = 2.0):
         super().__init__()
@@ -70,11 +90,12 @@ class HTBAuxiliaryLoss(nn.Module):
                 head: torch.Tensor,
                 tail: torch.Tensor,
                 balance: torch.Tensor,
-                labels: torch.Tensor) -> torch.Tensor:
-        return self.htb(head, tail, balance, labels)
-                        
-                        
-class CxrModel3(pl.LightningModule):
+                labels: torch.Tensor,
+                slp_stats: tuple = None) -> torch.Tensor:
+        return self.htb(head, tail, balance, labels, slp_stats=slp_stats)
+
+
+class CxrModel4(pl.LightningModule):
     def __init__(
         self,
         lr,
@@ -84,25 +105,27 @@ class CxrModel3(pl.LightningModule):
         alpha_aux: float = 1.0,   # HTB 보조 loss 비율
         htb_gamma: float = 2.0,
     ):
-        super(CxrModel3, self).__init__()
+        super(CxrModel4, self).__init__()
         self.lr = lr
         self.classes = classes
         self.alpha_aux = alpha_aux
 
-        # self.backbone = Backbone3Head(timm_init_args)
+        # COMIC Backbone (3-Head)
         self.backbone = FusionBackbone3Head(timm_init_args, "export/convnext_stage1_for_fusion2.pth")
 
         self.validation_step_outputs = []
         self.val_ap = AveragePrecision(task='binary')
         self.val_auc = AUROC(task="binary")
 
-        # --- 기존 loss: BAL logits에만 사용 ---
-        #   여기서 ASL, BCE, Resample 등 어떤 것이든 가능
-        self.base_criterion = get_loss(**loss_init_args)
+        # SLP Estimator
+        self.cv_estimator = EstimatorCV(feature_num=768, class_num=len(classes))
 
-        # --- HTB 보조 loss: base_criterion을 그대로 내부에서 재사용 ---
+        # 1) Main Loss (SLP)
+        self.criterion_cls = get_loss(**loss_init_args)
+
+        # 2) HTB Aux Loss - Uses the SAME SLP loss instance as base
         self.aux_loss = HTBAuxiliaryLoss(
-            base_loss=self.base_criterion,
+            base_loss=self.criterion_cls,
             gamma=htb_gamma,
         )
 
@@ -112,21 +135,38 @@ class CxrModel3(pl.LightningModule):
 
     def shared_step(self, batch, batch_idx):
         image, label = batch
-        logits_head, logits_tail, logits_bal = self(image)
+        
+        # Get 3-head logits + features for SLP
+        logits_head, logits_tail, logits_bal, feat = self.backbone.forward_with_features(image)
+        _assert_finite(logits_bal, "logits_bal@shared_step")
 
-        # 1) 기존 main loss (bal만 사용)
-        base_loss = self.base_criterion(logits_bal, label)
+        # SLP: CV update (using balanced logits as main)
+        Prop, nonzero_var, zero_var, Sigma_cj, Ro_cj, Tao_cj = \
+            self.cv_estimator.update_CV(feat, label, logits_bal.detach())
+        
+        slp_stats = (Prop, nonzero_var, zero_var, Sigma_cj, Ro_cj, Tao_cj)
 
-        # 2) HTB 보조 loss
-        aux_loss = self.aux_loss(logits_head, logits_tail, logits_bal, label)
+        # 1) Main Loss (SLP applied to logits_bal)
+        slp_loss = self.criterion_cls(
+            *slp_stats,
+            logits_bal, label
+        )
+        _assert_finite(slp_loss, "slp_loss@shared_step")
 
-        loss = base_loss + self.alpha_aux * aux_loss
+        # 2) HTB Aux Loss (SLP applied inside HTB)
+        aux_loss = self.aux_loss(logits_head, logits_tail, logits_bal, label, slp_stats=slp_stats)
+        
+        # Total Loss
+        loss = slp_loss + self.alpha_aux * aux_loss
 
-        pred = torch.sigmoid(logits_bal).detach()
+        # Pred for metrics (using balanced logits)
+        with torch.no_grad():
+            probs = torch.sigmoid(logits_bal)
+            _assert_finite(probs, "probs@shared_step")
 
         return dict(
             loss=loss,
-            pred=pred,
+            pred=probs,
             label=label,
         )
 

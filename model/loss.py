@@ -4,6 +4,7 @@ import numpy as np
 import torch.nn.functional as F
 import torch.optim as optim
 from model.ce import BCELosswithDiffLogits, cross_entropy, binary_cross_entropy, partial_cross_entropy, kpos_cross_entropy, weight_reduce_loss
+from model.loss_asl_wasl_slp import ASLwithClassWeight2
 from torch.nn import Parameter
 
 pos_counts = torch.tensor([
@@ -39,6 +40,39 @@ def get_loss(type, class_instance_nums, total_instance_num):
         return MultiGrainedFocalLoss()
     elif type == 'slp':
         return ResampleLoss2(class_instance_nums=class_instance_nums, total_instance_num=total_instance_num)
+    elif type == 'waslslp1':
+        return ASLwithClassWeight2(
+            class_instance_nums, total_instance_num,
+            use_slp=True,
+            slp_cfg=dict(
+                coef_alpha=1.0/3.0,
+                coef_beta=0.7,
+                up_mult=12,  # CXR-LT에서 추천
+                dw_mult=9,
+            )
+        )
+    elif type == 'waslslp2':
+        return ASLwithClassWeight2(
+            class_instance_nums, total_instance_num,
+            use_slp=True,
+            slp_cfg=dict(
+                coef_alpha=0.4,
+                coef_beta=0.8,
+                up_mult=15,  # CXR-LT에서 추천
+                dw_mult=9,
+            )
+        )
+    elif type == 'waslslp3':
+        return ASLwithClassWeight2(
+            class_instance_nums, total_instance_num,
+            use_slp=True,
+            slp_cfg=dict(
+                coef_alpha=0.5,
+                coef_beta=0.5,
+                up_mult=9,  # CXR-LT에서 추천
+                dw_mult=6,
+            )
+        )
     else:
         raise ValueError(f'Unknown loss type: {type}')
 
@@ -657,25 +691,25 @@ class ResampleLoss2(nn.Module):
     def __init__(self,
                  class_instance_nums,
                  total_instance_num,
-                 up_mult=24,dw_mult=9,
+                 up_mult=12,dw_mult=9,
                  use_sigmoid=True,
                  reduction='mean',
                  loss_weight=1.0,
                  partial=False,
-                 focal=dict(
-                    focal=False,
-                    mode='focal',          # 또는 생략 (default = 'focal')
-                    gamma=2,
-                    balance_param=2.0
-                ),
                 #  focal=dict(
-                #     focal=True,
-                #     mode='asl',
-                #     gamma_neg=4,
-                #     gamma_pos=0,
-                #     clip=0.05,
-                #     balance_param=1.0
+                #     focal=False,
+                #     mode='focal',          # 또는 생략 (default = 'focal')
+                #     gamma=2,
+                #     balance_param=2.0
                 # ),
+                 focal=dict(
+                    focal=True,
+                    mode='asl',
+                    gamma_neg=4,
+                    gamma_pos=0,
+                    clip=0.05,
+                    balance_param=1.0
+                ),
                 #  focal=dict(
                 #     focal=True,
                 #     mode='apl',
@@ -789,13 +823,12 @@ class ResampleLoss2(nn.Module):
         # coef params
         self.coef_alpha = coef_param['coef_alpha']
         self.coef_beta = coef_param['coef_beta']
-
-        # self.class_freq = torch.from_numpy(np.asarray(
-        #     mmcv.load(freq_file)['class_freq'])).float().cuda()
-        # self.neg_class_freq = torch.from_numpy(
-        #     np.asarray(mmcv.load(freq_file)['neg_class_freq'])).float().cuda()
-        # self.num_classes = self.class_freq.shape[0]
-        # self.train_num = self.class_freq[0] + self.neg_class_freq[0]
+        
+        # 🔹 co-occurrence sparsification 하이퍼파라미터
+        #   - tao_th: P(j|c)가 이 값보다 작으면 0으로 날림
+        #   - tao_topk: 각 row(c)마다 상위 몇 개 co-occ만 살릴지
+        self.tao_th = 0.15        # 예: 0.15 ~ 0.20 정도부터 시도
+        self.tao_topk = 3         # 각 class당 top-3 co-occ만 사용
         
         # ⚙️ class frequency 계산 (config에서 직접)
         self.class_freq = torch.tensor(class_instance_nums, dtype=torch.float32).cuda()
@@ -1209,21 +1242,32 @@ class ResampleLoss2(nn.Module):
         C = labels.size(1)
         eps = 1e-6
 
-        _assert_finite(logits, "lpl.logits@input")
-        _assert_finite(labels, "lpl.labels@input")
-        _assert_finite(prop, "lpl.prop@input")
-        _assert_finite(nonzero_var_tensor, "lpl.nonzero_var@input")
-        _assert_finite(zero_var_tensor, "lpl.zero_var@input")
-        _assert_finite(normalized_sigma_cj, "lpl.sigma_cj@input")
-        _assert_finite(normalized_ro_cj, "lpl.ro_cj@input")
-        _assert_finite(normalized_tao_cj, "lpl.tao_cj@input")
-
         # ----- (1) coef_cc: 원본 논문식 버전 -----
         # ratio = σ_pos / σ_neg
         ratio = nonzero_var_tensor / (zero_var_tensor + eps)
 
         lam  = self.coef_alpha   # λ
         beta = self.coef_beta    # β
+        
+        # 🔹 2-1) co-occurrence sparsification (weak pair 제거 + top-K만 유지)
+        tao = normalized_tao_cj.clone()
+        
+         # (1) threshold 기반 마스킹
+        if self.tao_th is not None and self.tao_th > 0:
+            tao = torch.where(tao >= self.tao_th,
+                              tao,
+                              torch.zeros_like(tao))
+
+        # (2) row-wise top-K (각 c당 상위 K개 co-occ만)
+        if self.tao_topk is not None and self.tao_topk > 0:
+            # tao: [C, C]
+            vals, idx = torch.topk(tao, k=min(self.tao_topk, C), dim=1)
+            mask = torch.zeros_like(tao)
+            mask.scatter_(1, idx, 1.0)
+            tao = tao * mask
+        
+        normalized_tao_cj = tao
+        ratio = nonzero_var_tensor / (zero_var_tensor + eps)
 
         # 원본 코드 형태:
         # coef_cc = (1-(1-λ)*β)*prop + (1-λ)*β*(σ_pos / σ_neg)
@@ -1239,11 +1283,9 @@ class ResampleLoss2(nn.Module):
         eye = torch.eye(C, device=logits.device, dtype=coef_cj.dtype)
         coef_cj = coef_cj * (1.0 - eye) + torch.diag(coef_cc)  # 대각선 교체
 
-        _assert_finite(coef_cj, "lpl.coef_cj@after_build")
 
         # ----- (3) head / tail 분리 (평균 기준 threshold) -----
         quant = torch.sum(coef_cj) / (C * C)
-        _assert_finite(quant, "lpl.quant")
 
         split = torch.where(coef_cj > quant, 1.0, 0.0)  # head(1) vs tail(0)
         head_mask = split

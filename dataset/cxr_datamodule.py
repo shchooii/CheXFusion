@@ -41,10 +41,10 @@ class CxrDataModule(pl.LightningDataModule):
                 train_idx, val_idx = next(msss.split(train_df, train_df[self.cfg["classes"]].values))
                 train_df, val_df = train_df.iloc[train_idx], train_df.iloc[val_idx]
 
-            # self.train_dataset = CxrStudyIdDataset(self.cfg, train_df, transforms_train)
-            # self.val_dataset = CxrStudyIdDataset(self.cfg, val_df, transforms_val)
-            self.train_dataset = CxrDataset(self.cfg, train_df, transforms_train)
-            self.val_dataset   = CxrDataset(self.cfg, val_df,   transforms_val)
+            self.train_dataset = CxrStudyIdDataset(self.cfg, train_df, transforms_train)
+            self.val_dataset = CxrStudyIdDataset(self.cfg, val_df, transforms_val)
+            # self.train_dataset = CxrDataset(self.cfg, train_df, transforms_train)
+            # self.val_dataset   = CxrDataset(self.cfg, val_df,   transforms_val)
 
             if self.cfg["use_pseudo_label"]:
                 vin_dataset = VinDataset(self.cfg, self.vin_df, transforms_train)
@@ -62,8 +62,8 @@ class CxrDataModule(pl.LightningDataModule):
         if stage == "test" or stage is None:
             if self.test_df_path is not None and os.path.exists(self.test_df_path):
                 test_df = pd.read_csv(self.test_df_path)
-                # self.test_dataset = CxrStudyIdDataset(self.cfg, test_df, transforms_val)
-                self.test_dataset = CxrDataset(self.cfg, test_df, transforms_val)
+                self.test_dataset = CxrStudyIdDataset(self.cfg, test_df, transforms_val)
+                # self.test_dataset = CxrDataset(self.cfg, test_df, transforms_val)
             else:
                 self.test_dataset = None  # test 생략
 
