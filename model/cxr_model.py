@@ -12,7 +12,7 @@ class CxrModel(pl.LightningModule):
         super(CxrModel, self).__init__()
         self.lr = lr
         self.classes = classes
-        self.backbone = FusionBackbone(timm_init_args, 'export/convnext_stage1_for_fusion.pth')
+        self.backbone = FusionBackbone(timm_init_args, 'export/convnext_stage1_for_fusion2.pth')
         # self.backbone = Backbone(timm_init_args)
         self.validation_step_outputs = []
         self.val_ap = AveragePrecision(task='binary')

@@ -6,7 +6,7 @@ from transformers import get_cosine_schedule_with_warmup
 from model.layers import FusionBackboneMultiView
 from model.loss import get_loss
 
-
+# multi-view basic
 class CxrModel5(pl.LightningModule):
     def __init__(self, lr, classes, loss_init_args, timm_init_args,
                  lambda_pa=0.3, lambda_lat=0.3):
@@ -18,7 +18,7 @@ class CxrModel5(pl.LightningModule):
 
         self.backbone = FusionBackboneMultiView(
             timm_init_args,
-            pretrained_path='export/convnext_stage1_for_fusion.pth',
+            pretrained_path='export/convnext_stage1_for_fusion2.pth',
             num_classes=len(classes),
         )
         self.validation_step_outputs = []

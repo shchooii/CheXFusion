@@ -4,7 +4,7 @@ import pandas as pd
 import lightning.pytorch as pl
 from torch.utils.data import DataLoader, ConcatDataset
 from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
-from dataset.cxr_dataset import CxrDataset, CxrBalancedDataset, CxrStudyIdDataset
+from dataset.cxr_dataset import CxrDataset, CxrBalancedDataset, CxrStudyIdDataset, CxrStudyIdDataset2
 from dataset.vin_dataset import VinDataset
 from dataset.nih_dataset import NihDataset
 from dataset.chexpert_dataset import ChexpertDataset
@@ -41,7 +41,7 @@ class CxrDataModule(pl.LightningDataModule):
                 train_idx, val_idx = next(msss.split(train_df, train_df[self.cfg["classes"]].values))
                 train_df, val_df = train_df.iloc[train_idx], train_df.iloc[val_idx]
 
-            self.train_dataset = CxrStudyIdDataset(self.cfg, train_df, transforms_train)
+            self.train_dataset = CxrStudyIdDataset2(self.cfg, train_df, transforms_train)
             self.val_dataset = CxrStudyIdDataset(self.cfg, val_df, transforms_val)
             # self.train_dataset = CxrDataset(self.cfg, train_df, transforms_train)
             # self.val_dataset   = CxrDataset(self.cfg, val_df,   transforms_val)
