@@ -19,7 +19,7 @@ class MyLightningCLI(LightningCLI):
 
 def cli_main():
     torch.set_float32_matmul_precision('high')
-    cli = MyLightningCLI(CxrModel9, CxrDataModule, save_config_callback=None)
+    cli = MyLightningCLI(CxrModel, CxrDataModule, save_config_callback=None)
 
 if __name__ == "__main__":
     cli_main()

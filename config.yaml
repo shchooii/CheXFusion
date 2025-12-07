@@ -19,7 +19,7 @@ trainer:
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: save/stage02mv09
+        dirpath: save/stage02mv10
         filename: '{epoch:02d}-{val_loss:.4f}-{val_ap:.5f}'
         save_top_k: 10
         monitor: val_loss
@@ -186,6 +186,6 @@ data:
       - Support Devices
       - Tortuous Aorta
 
-ckpt_path: save/stage02mv09/epoch=06-val_loss=0.0801-val_ap=0.36556.ckpt
+ckpt_path: save/stage0200/epoch=06-val_loss=0.0603-val_ap=0.36228.ckpt
 # save/attemptst202/epoch=06-val_loss=0.0007-val_ap=0.36387.ckpt
 # save/baseline01/epoch=06-val_loss=0.0601-val_ap=0.35336.ckpt

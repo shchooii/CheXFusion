@@ -150,6 +150,8 @@ class CxrModel3(pl.LightningModule):
         val_auroc = []
         C = len(self.classes)
         for i in range(C):
+            self.val_ap.reset()
+            self.val_auc.reset()
             ap = self.val_ap(preds[:, i], labels[:, i].long())
             auroc = self.val_auc(preds[:, i], labels[:, i].long())
             val_ap.append(ap)
@@ -186,6 +188,8 @@ class CxrModel3(pl.LightningModule):
         val_ap = []
         val_auroc = []
         for i in range(26):
+            self.val_ap.reset()
+            self.val_auc.reset()
             ap = self.val_ap(preds[:, i], labels[:, i].long())
             auroc = self.val_auc(preds[:, i], labels[:, i].long())
             val_ap.append(ap)

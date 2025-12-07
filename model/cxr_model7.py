@@ -5,13 +5,13 @@ from torch.optim import AdamW
 from torchmetrics import AveragePrecision, AUROC
 from transformers import get_cosine_schedule_with_warmup
 
-from model.layers import FusionBackboneMultiView2
+from model.layers import FusionBackboneMultiView2, FusionBackboneMultiView3
 from model.loss import get_loss
 
 class CxrModel7(pl.LightningModule):
     def __init__(
         self, lr, classes, loss_init_args, timm_init_args,
-        lambda_pa=0.3, lambda_lat=0.3, lambda_consistency=0.5
+        lambda_pa=0.3, lambda_lat=0.3, lambda_consistency=0.2
     ):
         super(CxrModel7, self).__init__()
         self.save_hyperparameters()
@@ -21,7 +21,7 @@ class CxrModel7(pl.LightningModule):
         self.lambda_lat = lambda_lat
         self.lambda_consistency = lambda_consistency
 
-        self.backbone = FusionBackboneMultiView2(
+        self.backbone = FusionBackboneMultiView3(
             timm_init_args,
             pretrained_path='export/convnext_stage1_for_fusion2.pth',
             num_classes=len(classes),
@@ -98,6 +98,8 @@ class CxrModel7(pl.LightningModule):
         val_ap = []
         val_auroc = []
         for i in range(len(self.classes)):
+            self.val_ap.reset()
+            self.val_auc.reset()
             ap = self.val_ap(preds[:, i], labels[:, i].long())
             auroc = self.val_auc(preds[:, i], labels[:, i].long())
             val_ap.append(ap)
@@ -151,6 +153,8 @@ class CxrModel7(pl.LightningModule):
         val_ap = []
         val_auroc = []
         for i in range(len(self.classes)):
+            self.val_ap.reset()
+            self.val_auc.reset()
             ap = self.val_ap(preds[:, i], labels[:, i].long())
             auroc = self.val_auc(preds[:, i], labels[:, i].long())
             val_ap.append(ap)
