@@ -6,18 +6,6 @@ from transformers import get_cosine_schedule_with_warmup
 from model.layers import Backbone, FusionBackbone
 from model.loss import get_loss
 from model.estimator import EstimatorCV
-
-def _assert_finite(t: torch.Tensor, name: str):
-    if not torch.isfinite(t.detach()).all():
-        bad = t.detach()
-        msg = (
-            f"[NaN/Inf DETECTED] {name} has non-finite values: "
-            f"min={bad.min().item() if bad.numel() else 'NA'}, "
-            f"max={bad.max().item() if bad.numel() else 'NA'}, "
-            f"any_nan={(~torch.isfinite(bad)).any().item()}"
-        )
-        raise AssertionError(msg)
-    
     
 class CxrModel2(pl.LightningModule):
     def __init__(self, lr, classes, loss_init_args, timm_init_args):
@@ -25,8 +13,8 @@ class CxrModel2(pl.LightningModule):
         self.lr = lr
         self.classes = classes
         
-        # self.backbone = Backbone(timm_init_args)
-        self.backbone = FusionBackbone(timm_init_args, 'export/convnext_stage1_for_fusion2.pth')
+        self.backbone = Backbone(timm_init_args)
+        # self.backbone = FusionBackbone(timm_init_args, 'export/convnext_stage1_for_fusion2.pth')
         self.validation_step_outputs = []
         self.val_ap = AveragePrecision(task='binary')
         self.val_auc = AUROC(task="binary")
@@ -42,7 +30,6 @@ class CxrModel2(pl.LightningModule):
 
         # logits + features
         logits_raw, feat = self.backbone.forward_with_features(image)
-        _assert_finite(logits_raw, "logits_raw@shared_step")
 
         # CV update (detach)
         Prop, nonzero_var, zero_var, Sigma_cj, Ro_cj, Tao_cj = \
@@ -53,12 +40,10 @@ class CxrModel2(pl.LightningModule):
             Prop, nonzero_var, zero_var, Sigma_cj, Ro_cj, Tao_cj,
             logits_raw, label
         )
-        _assert_finite(loss, "loss@shared_step")
 
         # metrics → original logits only
         with torch.no_grad():
             probs = torch.sigmoid(logits_raw)
-            _assert_finite(probs, "probs@shared_step")
 
         return dict(loss=loss, pred=probs, label=label)
 

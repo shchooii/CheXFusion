@@ -1,10 +1,12 @@
 import os
+import torch
 import numpy as np
 import pandas as pd
 import lightning.pytorch as pl
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader, ConcatDataset, WeightedRandomSampler
+from lightning.pytorch.utilities import CombinedLoader
 from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
-from dataset.cxr_dataset import CxrDataset, CxrBalancedDataset, CxrStudyIdDataset, CxrStudyIdDataset2
+from dataset.cxr_dataset import CxrDataset, CxrBalancedDataset, CxrStudyIdDataset
 from dataset.vin_dataset import VinDataset
 from dataset.nih_dataset import NihDataset
 from dataset.chexpert_dataset import ChexpertDataset
@@ -12,6 +14,11 @@ from dataset.transforms import get_transforms
 
 
 class CxrDataModule(pl.LightningDataModule):
+    CLASS_COUNTS = [
+        67597, 4361, 76900, 16038, 38574, 4255, 30119, 1158, 11883, 4049,
+        10218, 2533, 79931, 5529, 41869, 7663, 69240, 675, 3369, 788,
+        48093, 543, 14983, 2453, 89140, 3499
+    ]
     def __init__(self, datamodule_cfg, dataloader_init_args):
         super(CxrDataModule, self).__init__()
         self.cfg = datamodule_cfg
@@ -62,8 +69,8 @@ class CxrDataModule(pl.LightningDataModule):
         if stage == "test" or stage is None:
             if self.test_df_path is not None and os.path.exists(self.test_df_path):
                 test_df = pd.read_csv(self.test_df_path)
-                self.test_dataset = CxrStudyIdDataset(self.cfg, test_df, transforms_val)
-                # self.test_dataset = CxrDataset(self.cfg, test_df, transforms_val)
+                # self.test_dataset = CxrStudyIdDataset(self.cfg, test_df, transforms_val)
+                self.test_dataset = CxrDataset(self.cfg, test_df, transforms_val)
             else:
                 self.test_dataset = None  # test 생략
 
@@ -83,7 +90,7 @@ class CxrDataModule(pl.LightningDataModule):
             else:
                 pred_df = pd.read_csv(self.cfg["pred_df_path"])
                 self.pred_dataset = CxrStudyIdDataset(self.cfg, pred_df, transforms_val)
-
+    
     def train_dataloader(self):
         return DataLoader(self.train_dataset, **self.dataloader_init_args, shuffle=True)
 

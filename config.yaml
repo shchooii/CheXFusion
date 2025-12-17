@@ -19,7 +19,7 @@ trainer:
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: save/stage02mv10
+        dirpath: save/COMICst0221
         filename: '{epoch:02d}-{val_loss:.4f}-{val_ap:.5f}'
         save_top_k: 10
         monitor: val_loss
@@ -55,9 +55,9 @@ trainer:
     #       write_interval: epoch
     #       chexpert_train_df_path: data/chexpert/train_processed.csv
     #       chexpert_pseudo_train_df_path: data/chexpert/train_processed_pseudo_labeled.csv
-    - class_path: lightning.pytorch.callbacks.StochasticWeightAveraging
-      init_args:
-        swa_lrs: 1e-2
+    # - class_path: lightning.pytorch.callbacks.StochasticWeightAveraging
+    #   init_args:
+    #     swa_lrs: 1e-2
     - class_path: lightning.pytorch.callbacks.early_stopping.EarlyStopping
       init_args:
         monitor: val_ap
@@ -73,7 +73,7 @@ trainer:
   benchmark: true
   max_epochs: 1000
 model:
-  lr: 3e-5
+  lr: 1e-3
   classes: 
   - Atelectasis
   - Calcification of the Aorta
@@ -102,7 +102,7 @@ model:
   - Support Devices
   - Tortuous Aorta
   loss_init_args:
-    type: wasl
+    type: mfm
     class_instance_nums:
       - 67597
       - 4361
@@ -186,6 +186,6 @@ data:
       - Support Devices
       - Tortuous Aorta
 
-ckpt_path: save/stage0200/epoch=06-val_loss=0.0603-val_ap=0.36228.ckpt
+ckpt_path: null
 # save/attemptst202/epoch=06-val_loss=0.0007-val_ap=0.36387.ckpt
 # save/baseline01/epoch=06-val_loss=0.0601-val_ap=0.35336.ckpt

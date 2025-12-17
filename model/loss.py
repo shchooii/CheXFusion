@@ -15,7 +15,7 @@ pos_counts = torch.tensor([
 N_total = 264_849  # total_instance_num
 neg_counts = N_total - pos_counts
 
-def get_loss(type, class_instance_nums, total_instance_num):
+def get_loss(type, class_instance_nums, total_instance_num, reduction: str = "mean", **kwargs):
     if type == 'bce':
         return nn.BCEWithLogitsLoss()
     elif type == 'wbce':
@@ -37,51 +37,21 @@ def get_loss(type, class_instance_nums, total_instance_num):
     elif type == 'hill':
         return Hill()
     elif type == 'mfm':
-        return MultiGrainedFocalLoss()
+        return MultiGrainedFocalLoss(reduction=reduction)
     elif type == 'slp':
         return ResampleLoss2(class_instance_nums=class_instance_nums, total_instance_num=total_instance_num)
-    elif type == 'waslslp1':
-        return ASLwithClassWeight2(
-            class_instance_nums, total_instance_num,
-            use_slp=True,
-            slp_cfg=dict(
-                coef_alpha=1.0/3.0,
-                coef_beta=0.7,
-                up_mult=12,  # CXR-LT에서 추천
-                dw_mult=9,
-            )
-        )
-    elif type == 'waslslp2':
-        return ASLwithClassWeight2(
-            class_instance_nums, total_instance_num,
-            use_slp=True,
-            slp_cfg=dict(
-                coef_alpha=0.4,
-                coef_beta=0.8,
-                up_mult=15,  # CXR-LT에서 추천
-                dw_mult=9,
-            )
-        )
-    elif type == 'waslslp3':
-        return ASLwithClassWeight2(
-            class_instance_nums, total_instance_num,
-            use_slp=True,
-            slp_cfg=dict(
-                coef_alpha=0.5,
-                coef_beta=0.5,
-                up_mult=9,  # CXR-LT에서 추천
-                dw_mult=6,
-            )
-        )
     else:
         raise ValueError(f'Unknown loss type: {type}')
-
-
+ 
 class MultiGrainedFocalLoss(nn.Module):
-    def __init__(self, gamma_neg=4, gamma_pos=0, gamma_class_ng=1.2,
-                 clip=0.05, eps=1e-8,
-                 disable_torch_grad_focal_loss=True,
-                 distribution_path=None, co_occurrence_matrix=None):
+    def __init__(
+        self,
+        gamma_neg=4, gamma_pos=0, gamma_class_ng=1.2,
+        clip=0.05, eps=1e-8,
+        disable_torch_grad_focal_loss=True,
+        distribution_path=None, co_occurrence_matrix=None,
+        reduction: str = "mean",   # ★ 추가
+    ):
         super(MultiGrainedFocalLoss, self).__init__()
 
         self.gamma_neg = gamma_neg
@@ -92,67 +62,48 @@ class MultiGrainedFocalLoss(nn.Module):
         self.disable_torch_grad_focal_loss = disable_torch_grad_focal_loss
         self.eps = eps
         self.distribution_path = distribution_path
-        
-        # class_instance_nums 상수로 “직접” 내장
+        self.reduction = reduction   # ★ 추가
+
         class_counts = [
             67597, 4361, 76900, 16038, 38574, 4255, 30119, 1158, 11883, 4049,
             10218, 2533, 79931, 5529, 41869, 7663, 69240, 675, 3369, 788,
             48093, 543, 14983, 2453, 89140, 3499
         ]
-        # 버퍼로 보관(디바이스 전환 자동 대응)
         self.register_buffer("class_counts", torch.tensor(class_counts, dtype=torch.float32))
         self.register_buffer("weight", torch.ones(len(class_counts), dtype=torch.float32))
         self._weight_ready = False
-
         # self.spls_loss = SPLC(batch_size=32)
 
     @torch.no_grad()
     def create_weight(self, device=None, dtype=torch.float32):
-        """
-        외부 입력 없이 내부 상수 class_counts로 weight 계산.
-        호출은 forward에서 x.device/dtype에 맞춰 1회 자동 실행.
-        """
-        dist = self.class_counts.to(device=device, dtype=dtype)  # [C]
+        if device is None:
+            device = self.class_counts.device
+        dist = self.class_counts.to(device=device, dtype=dtype)
         total = dist.sum()
-        prob = dist / (total + self.eps)         # p_i
-        prob = prob / (prob.max() + self.eps)    # 정규화(최대=1)
-        # 논문/원코드와 동일한 변환: (-log p + 1)^(1/6)
+        prob = dist / (total + self.eps)
+        prob = prob / (prob.max() + self.eps)
         weight = torch.pow(-torch.log(prob.clamp_min(self.eps)) + 1.0, 1.0 / 6)
-
-        # 버퍼 갱신
         self.weight = weight
         self._weight_ready = True
-        
-
-    @torch.no_grad()                  
-    def create_co_occurrence_matrix(self, co_occurrence_matrix):
-        co_occurrence_matrix = torch.tensor(np.load(co_occurrence_matrix)).cuda()
-        self.co_occurrence_matrix = co_occurrence_matrix / co_occurrence_matrix.sum(axis=0)
-
 
     def forward(self, x, y):
-        
+        # x, y: [B, C]
         if not self._weight_ready:
             self.create_weight(device=x.device, dtype=x.dtype)
 
         weight = self.weight.to(dtype=x.dtype, device=x.device)
 
-        # positive -
         x_sigmoid = torch.pow(torch.sigmoid(x), 1)
-        gamma_class_pos = 1
-        xs_pos = x_sigmoid * gamma_class_pos
+        xs_pos = x_sigmoid * self.gamma_class_pos
         xs_neg = 1 - x_sigmoid
 
-        # negative +
         if self.clip is not None and self.clip > 0:
             xs_neg = (xs_neg + self.clip).clamp(max=1)
 
-        # basic CE
         los_pos = y * torch.log(xs_pos.clamp(min=self.eps))
         los_neg = (1 - y) * torch.log(xs_neg.clamp(min=self.eps))
-        loss = (los_pos + los_neg) * weight
+        loss = (los_pos + los_neg) * weight  # [B, C]
 
-        # asymmetric focusing
         if self.gamma_neg > 0 or self.gamma_pos > 0:
             with torch.no_grad():
                 pt0 = xs_pos * y
@@ -160,12 +111,19 @@ class MultiGrainedFocalLoss(nn.Module):
                 pt = pt0 + pt1
                 one_sided_gamma = (self.gamma_pos) * y + (self.gamma_neg + weight) * (1 - y)
                 one_sided_w = torch.pow(1 - pt, one_sided_gamma)
+            loss = loss * one_sided_w  # [B, C]
 
-            loss = loss * one_sided_w
+        # 여기서부터 reduction 제어
+        # 샘플별 loss: [B]
+        loss_per_sample = -loss.sum(dim=1)
 
-        loss =- loss.sum()
-        return loss
-    
+        if self.reduction == "none":
+            return loss_per_sample                # [B]
+        elif self.reduction == "sum":
+            return loss_per_sample.sum()          # scalar
+        else:  # "mean"
+            return loss_per_sample.mean()         # scalar
+   
     
 class BCEwithClassWeights(nn.Module):
     def __init__(self, class_instance_nums, total_instance_num):
@@ -649,25 +607,25 @@ class ResampleLoss2(nn.Module):
     def __init__(self,
                  class_instance_nums,
                  total_instance_num,
-                 up_mult=12,dw_mult=9,
+                 up_mult=9,dw_mult=9,
                  use_sigmoid=True,
                  reduction='mean',
                  loss_weight=1.0,
                  partial=False,
-                #  focal=dict(
-                #     focal=False,
-                #     mode='focal',          # 또는 생략 (default = 'focal')
-                #     gamma=2,
-                #     balance_param=2.0
-                # ),
                  focal=dict(
-                    focal=True,
-                    mode='asl',
-                    gamma_neg=4,
-                    gamma_pos=0,
-                    clip=0.05,
-                    balance_param=1.0
+                    focal=False,
+                    mode='focal',
+                    gamma=2,
+                    balance_param=2.0
                 ),
+                #  focal=dict(
+                #     focal=True,
+                #     mode='asl',
+                #     gamma_neg=4,
+                #     gamma_pos=0,
+                #     clip=0.05,
+                #     balance_param=1.0
+                # ),
                 #  focal=dict(
                 #     focal=True,
                 #     mode='apl',
@@ -782,12 +740,6 @@ class ResampleLoss2(nn.Module):
         self.coef_alpha = coef_param['coef_alpha']
         self.coef_beta = coef_param['coef_beta']
         
-        # 🔹 co-occurrence sparsification 하이퍼파라미터
-        #   - tao_th: P(j|c)가 이 값보다 작으면 0으로 날림
-        #   - tao_topk: 각 row(c)마다 상위 몇 개 co-occ만 살릴지
-        self.tao_th = 0.15        # 예: 0.15 ~ 0.20 정도부터 시도
-        self.tao_topk = 3         # 각 class당 top-3 co-occ만 사용
-        
         # ⚙️ class frequency 계산 (config에서 직접)
         self.class_freq = torch.tensor(class_instance_nums, dtype=torch.float32).cuda()
         self.num_classes = len(class_instance_nums)
@@ -837,24 +789,17 @@ class ResampleLoss2(nn.Module):
                 **kwargs):
 
         assert reduction_override in (None, 'none', 'mean', 'sum')
-        
+
         _assert_finite(cls_score, "resample2.cls_score@input")
         _assert_finite(label, "resample2.label@input")
-        
+
         reduction = (
             reduction_override if reduction_override else self.reduction)
 
         weight = self.reweight_functions(label)
-        if weight is not None:
-            _assert_finite(weight, "resample2.weight@after_reweight")  
-        
-        
         
         cls_score, weight = self.logit_reg_functions(label.float(), cls_score, norm_prop, nonzero_var_tensor, zero_var_tensor, normalized_sigma_cj, normalized_ro_cj, 
                 normalized_tao_cj,weight)
-        _assert_finite(cls_score, "resample2.cls_score@after_logit_reg")
-        if weight is not None:
-            _assert_finite(weight, "resample2.weight@after_logit_reg")
     
         if self.focal:
             # -------------------------
@@ -885,12 +830,9 @@ class ResampleLoss2(nn.Module):
                     avg_factor=None
                 )   # shape: [B,C] 또는 [B,C,C]
 
-                _assert_finite(base_loss, "resample2.focal2.base_loss")
-
                 # 2) pt = exp(-BCE)
                 logpt = -base_loss
                 pt = torch.exp(logpt)
-                _assert_finite(pt, "resample2.focal2.pt")
 
                 # 3) Focal term
                 focal_loss = ((1 - pt) ** self.gamma) * base_loss  # (N,C) or (N,C,C)
@@ -914,7 +856,6 @@ class ResampleLoss2(nn.Module):
                     reduction=reduction,
                     avg_factor=avg_factor
                 )
-                _assert_finite(loss, "resample2.focal2.loss@after_reduce")
 
             # -------------------------
             # mode = 'asl' (Asymmetric Loss)
@@ -1179,112 +1120,59 @@ class ResampleLoss2(nn.Module):
         perturb = head+tail
 
         return perturb.detach()
+ 
     
     def lpl_imbalance(self, logits, labels,
-                      prop,               # [C]  self.Prop (EMA / batch proportion)
-                      nonzero_var_tensor, # [C]  σ_c^(+)
-                      zero_var_tensor,    # [C]  σ_c^(-)
-                      normalized_sigma_cj,  # [C,C]
-                      normalized_ro_cj,     # [C,C]
-                      normalized_tao_cj):   # [C,C]
-
-        """
-        logits: [B, C, C]
-        labels: [B, C, C]
-        prop:   [C]        (class proportion)
-        nonzero_var_tensor: [C]
-        zero_var_tensor:    [C]
-        normalized_*:       [C,C], 이미 [0,1]로 정규화된 형태
-        """
+                  prop,
+                  nonzero_var_tensor,
+                  zero_var_tensor,
+                  normalized_sigma_cj,
+                  normalized_ro_cj,
+                  normalized_tao_cj):
 
         C = labels.size(1)
         eps = 1e-6
 
-        # ----- (1) coef_cc: 원본 논문식 버전 -----
-        # ratio = σ_pos / σ_neg
-        ratio = nonzero_var_tensor / (zero_var_tensor + eps)
+        # 🔹 sparsification 없이 그대로 사용
+        safe_zero = torch.clamp(zero_var_tensor, min=eps)
+        ratio = nonzero_var_tensor / safe_zero
 
-        lam  = self.coef_alpha   # λ
-        beta = self.coef_beta    # β
-        
-        # 🔹 2-1) co-occurrence sparsification (weak pair 제거 + top-K만 유지)
-        tao = normalized_tao_cj.clone()
-        
-         # (1) threshold 기반 마스킹
-        if self.tao_th is not None and self.tao_th > 0:
-            tao = torch.where(tao >= self.tao_th,
-                              tao,
-                              torch.zeros_like(tao))
+        lam  = self.coef_alpha
+        beta = self.coef_beta
 
-        # (2) row-wise top-K (각 c당 상위 K개 co-occ만)
-        if self.tao_topk is not None and self.tao_topk > 0:
-            # tao: [C, C]
-            vals, idx = torch.topk(tao, k=min(self.tao_topk, C), dim=1)
-            mask = torch.zeros_like(tao)
-            mask.scatter_(1, idx, 1.0)
-            tao = tao * mask
-        
-        normalized_tao_cj = tao
-        ratio = nonzero_var_tensor / (zero_var_tensor + eps)
-
-        # 원본 코드 형태:
-        # coef_cc = (1-(1-λ)*β)*prop + (1-λ)*β*(σ_pos / σ_neg)
         coef_cc = (1.0 - (1.0 - lam) * beta) * prop \
-                  + (1.0 - lam) * beta * ratio        # [C]
+                + (1.0 - lam) * beta * ratio
 
-        # ----- (2) coef_cj: subclass-wise 계수 (off-diagonal + diag=coef_cc) -----
-        # α_cj = λ τ_cj + (1-λ) [ β σ_cj + (1-β) ρ_cj ]
         coef_cj = lam * normalized_tao_cj \
-                  + (1.0 - lam) * (beta * normalized_sigma_cj
-                                   + (1.0 - beta) * normalized_ro_cj)  # [C,C]
+                + (1.0 - lam) * (beta * normalized_sigma_cj
+                                + (1.0 - beta) * normalized_ro_cj)
 
         eye = torch.eye(C, device=logits.device, dtype=coef_cj.dtype)
-        coef_cj = coef_cj * (1.0 - eye) + torch.diag(coef_cc)  # 대각선 교체
+        coef_cj = coef_cj * (1.0 - eye) + torch.diag(coef_cc)
 
-
-        # ----- (3) head / tail 분리 (평균 기준 threshold) -----
         quant = torch.sum(coef_cj) / (C * C)
-
-        split = torch.where(coef_cj > quant, 1.0, 0.0)  # head(1) vs tail(0)
+        split = torch.where(coef_cj > quant, 1.0, 0.0)
         head_mask = split
         tail_mask = 1.0 - split
 
-        # ----- (4) 그룹별(min–max) 정규화 함수 -----
         def _group_minmax(x, mask):
-            """
-            x:    [C,C]
-            mask: [C,C] (0/1)
-            반환: mask가 1인 위치만 min–max 정규화된 값, 나머지는 0
-            """
             x_masked = x * mask
             if (mask > 0).sum() == 0:
-                # 해당 그룹이 아예 없으면 그대로 반환
                 return x_masked
-
             valid = x_masked[mask > 0]
             v_min = valid.min()
             v_max = valid.max()
             scale = (v_max - v_min + eps)
-
             x_norm = (x_masked - v_min) / scale
             x_norm = torch.clamp(x_norm, min=0.0)
             return x_norm
 
-        # head / tail 각각 자기 그룹 안에서만 0~1로 스케일링
         head_coef = _group_minmax(coef_cj, head_mask)
         tail_coef = _group_minmax(coef_cj, tail_mask)
 
-        _assert_finite(head_coef, "lpl.head_coef@after_norm")
-        _assert_finite(tail_coef, "lpl.tail_coef@after_norm")
-
-        # ----- (5) 계수 → PGD step 수 -----
         head_dw_steps = torch.floor(head_coef * self.dw_mult).to(logits.device)
         tail_up_steps = torch.floor(tail_coef * self.up_mult).to(logits.device)
 
-        _assert_finite(head_dw_steps, "lpl.head_dw_steps")
-        _assert_finite(tail_up_steps, "lpl.tail_up_steps")
-
-        # ----- (6) PGD-like perturbation -----
         logits_head_dw = self.pgd_like_diff_sign(
             logits, labels, head_dw_steps, -1.0
         ) - logits
@@ -1292,13 +1180,9 @@ class ResampleLoss2(nn.Module):
             logits, labels, tail_up_steps,  1.0
         ) - logits
 
-        _assert_finite(logits_head_dw, "lpl.logits_head_dw")
-        _assert_finite(logits_tail_up, "lpl.logits_tail_up")
-
         perturb = logits_head_dw + logits_tail_up
-        _assert_finite(perturb, "lpl.perturb@output")
-
         return perturb.detach()
+
 
 
 
@@ -1324,15 +1208,7 @@ class ResampleLoss2(nn.Module):
                         nonzero_var_tensor, zero_var_tensor,
                         normalized_sigma_cj, normalized_ro_cj, normalized_tao_cj,
                         weight=None):
-        """
-        labels: [B, C]
-        logits: [B, C]
-        반환 logits: 항상 [B, C]  (SLP 켜져도 최종은 [B, C]로 접음)
-        weight: [B, C] 그대로 유지
-        """
         _assert_finite(logits, "logit_reg.logits@input")
-        _assert_finite(labels, "logit_reg.labels@input")
-
         if not self.logit_reg:
             return logits, weight
 
@@ -1344,26 +1220,17 @@ class ResampleLoss2(nn.Module):
             logits_exp = logits.view(B, C, 1).expand(B, C, C).clone()
             labels_exp = labels.view(B, C, 1).expand(B, C, C).clone()
 
-            _assert_finite(norm_prop, "logit_reg.norm_prop@input")
-            _assert_finite(nonzero_var_tensor, "logit_reg.nonzero_var@input")
-            _assert_finite(zero_var_tensor, "logit_reg.zero_var@input")
-            _assert_finite(normalized_sigma_cj, "logit_reg.sigma_cj@input")
-            _assert_finite(normalized_ro_cj, "logit_reg.ro_cj@input")
-            _assert_finite(normalized_tao_cj, "logit_reg.tao_cj@input")
-
             perturb = self.lpl_imbalance(
                 logits_exp, labels_exp,
                 norm_prop, nonzero_var_tensor, zero_var_tensor,
                 normalized_sigma_cj, normalized_ro_cj, normalized_tao_cj
             )
-            _assert_finite(perturb, "logit_reg.perturb@from_lpl")
 
             logits_exp = logits_exp + perturb
-            _assert_finite(logits_exp, "logit_reg.logits@after_lpl")
 
             # ⭐ 핵심: subclass 차원 평균 내서 다시 [B, C]로 접는다
             logits = logits_exp.mean(dim=2)
-            _assert_finite(logits, "logit_reg.logits@after_mean")
+        _assert_finite(logits, "logit_reg.logits@after_init_bias")
 
         # --- neg_scale (음성쪽 scale) ---
         if 'neg_scale' in self.logit_reg:
@@ -1376,7 +1243,6 @@ class ResampleLoss2(nn.Module):
 
         # weight는 건드리지 않는다 (항상 [B,C])
         return logits, weight
-
 
 
     def rebalance_weight(self, gt_labels):
