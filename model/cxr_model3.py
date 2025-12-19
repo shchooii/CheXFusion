@@ -6,8 +6,9 @@ import torch.nn.functional as F
 from torchmetrics import AveragePrecision, AUROC
 from transformers import get_cosine_schedule_with_warmup
 
-from model.loss import get_loss
-from model.layers import FusionBackbone2
+from model.loss import get_loss, ResampleLoss2
+from model.estimator import EstimatorCV
+from model.layers import FusionBackbone2, SingleViewBackboneCOMIC
 
 
 # =========================================================
@@ -46,9 +47,7 @@ class AdditiveEnvAttention(nn.Module):
 
         ffn_out = self.ffn(x)                    # [B,1,D]
         x = self.ln2(x + ffn_out)                # residual + LN
-        F_ctx = x.squeeze(1)                     # [B,D]
-
-        # Eq.(8): f_b = Attn(...) + f_hat_b
+        f_ctx = x.squeeze(1)                     # [B,D]
         f_b = f_ctx + f_hat_b
         return f_b
 
@@ -69,7 +68,7 @@ class CxrModel3(pl.LightningModule):
         temperature: float = 2.0,
 
         # Eq.9/10 params
-        rho: float = 0.05,
+        rho: float = 0.2,
         eta: float = 1e-6,
         Ng: int = 1,                  # 기본값, 아래에서 head별로 override 가능
 
@@ -84,11 +83,15 @@ class CxrModel3(pl.LightningModule):
         self.save_hyperparameters(ignore=["classes"])
         self.classes = classes
         self.lr = lr
-
-        self.backbone = FusionBackbone2(
-            timm_init_args=timm_init_args,
-            pretrained_path="export/convnext_stage1_for_fusion2.pth",
-        )
+        
+        # Stage 1
+        self.backbone = SingleViewBackboneCOMIC(timm_init_args=timm_init_args)
+        
+        # Stage 2
+        # self.backbone = FusionBackbone2(
+        #     timm_init_args=timm_init_args,
+        #     pretrained_path="export/convnext_stage1_for_fusion2.pth",
+        # )
 
         self.criterion_cls = get_loss(**loss_init_args)
         self.irm_base = nn.BCEWithLogitsLoss(reduction="mean")
@@ -123,6 +126,12 @@ class CxrModel3(pl.LightningModule):
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
         self.total_steps = total_steps
+        
+        # SLP
+        self.cv_h = EstimatorCV(feature_num=768, class_num=len(classes))
+        self.cv_t = EstimatorCV(feature_num=768, class_num=len(classes))
+        self.cv_b = EstimatorCV(feature_num=768, class_num=len(classes))
+        self.resample_loss = ResampleLoss2()
 
     # -------------------------
     # pool feature
@@ -210,12 +219,13 @@ class CxrModel3(pl.LightningModule):
         image, label = batch
 
         # backbone raw logits + token features
-        zh_raw, zt_raw, zb_raw, x_trans, mask = self(image)
+        zh_raw, zt_raw, zb_raw, f_base = self(image)
+        # zh_raw, zt_raw, zb_raw, x_trans, mask = self(image)
 
         # -----------------------------
         # Eq.(8) env features
-        # -----------------------------
-        f_base = self._mean_pool_feature(x_trans, mask)  # [B,768]
+        # # -----------------------------
+        # f_base = self._mean_pool_feature(x_trans, mask) # [B,768]
         f_h = self.proj_h(f_base)
         f_t = self.proj_t(f_base)
         f_hat_b = self.proj_b(f_base)
@@ -232,26 +242,43 @@ class CxrModel3(pl.LightningModule):
         zh = zh_raw + self.plm_gamma * z9_h
         zt = zt_raw + self.plm_gamma * z9_t
         zb = zb_raw + self.plm_gamma * z9_b
-
+        
         # -----------------------------
         # main loss (balanced)
         # -----------------------------
         loss_cls = self.criterion_cls(zb, label)
+        # SLP
+        stats_b = self.cv_b.update_CV(f_b, label, zb.detach())
+        B, C = zb.shape
+        zb_exp = zb.view(B, C, 1).expand(B, C, C).clone()
+        label_exp = label.view(B, C, 1).expand(B, C, C).clone()
+        zb_slp = zb + self.resample_loss.lpl_imbalance(zb_exp, label_exp, *stats_b).mean(dim=2)
+        loss_cls = self.resample_loss(*stats_b, zb_slp, label)
 
         # -----------------------------
         # Eq.(7) e_t update
-        #   - zb가 x_trans를 통해 역전파되도록 “그래프 사용”이 보장되는 경로에서 grad 추출
         # -----------------------------
+        # stage 1 버전
         if phase == "train":
-            grad_x = torch.autograd.grad(loss_cls, x_trans, retain_graph=True, create_graph=False)[0]
-            grad_base = self._mean_pool_feature(grad_x, mask)      # [B,768]
-            grad_fb = self.proj_b(grad_base).detach()              # [B,768]
-            self.et.mul_(self.mu).add_(grad_fb.sum(dim=0))
+            g = torch.autograd.grad(loss_cls, f_hat_b, retain_graph=True, create_graph=False)[0]  # [B,768]
+            self.et.mul_(self.mu).add_(g.sum(dim=0).detach())
 
             # 폭주 클립(실전 안정화)
             n = self.et.norm()
             if n > 1e3:
                 self.et.mul_(1e3 / (n + 1e-6))
+        
+        # stage 2 버전
+        # if phase == "train": 
+        #     grad_x = torch.autograd.grad(loss_cls, x_trans, retain_graph=True, create_graph=False)[0] 
+        #     grad_base = self._mean_pool_feature(grad_x, mask) # [B,768] 
+        #     grad_fb = self.proj_b(grad_base).detach() # [B,768] 
+        #     self.et.mul_(self.mu).add_(grad_fb.sum(dim=0)) 
+            
+        #     # 폭주 클립(실전 안정화) 
+        #     n = self.et.norm() 
+        #     if n > 1e3: 
+        #         self.et.mul_(1e3 / (n + 1e-6))
 
         # -----------------------------
         # Eq.(10) head/tail logit adjustment
@@ -259,6 +286,14 @@ class CxrModel3(pl.LightningModule):
         # -----------------------------
         zhat_h = self._logit_adjust_eq10(zh, self.backbone.head_h, f_b, sign=+1.0)
         zhat_t = self._logit_adjust_eq10(zt, self.backbone.head_t, f_b, sign=-1.0)
+        
+        # SLP
+        stats_h = self.cv_h.update_CV(f_h, label, zh.detach())
+        stats_t = self.cv_t.update_CV(f_t, label, zt.detach())
+        zh_exp = zhat_h.view(B, C, 1).expand(B, C, C).clone()
+        zt_exp = zhat_t.view(B, C, 1).expand(B, C, C).clone()
+        zhat_h = zhat_h + self.resample_loss.lpl_imbalance(zh_exp, label_exp, *stats_h).mean(dim=2)
+        zhat_t = zhat_t + self.resample_loss.lpl_imbalance(zt_exp, label_exp, *stats_t).mean(dim=2)
 
         # -----------------------------
         # Eq.(11) HTB
@@ -267,8 +302,10 @@ class CxrModel3(pl.LightningModule):
         p_h = torch.sigmoid(zhat_h / T).detach()
         p_t = torch.sigmoid(zhat_t / T).detach()
 
-        kl_h = self._distill_bce(zb, p_h, T)
-        kl_t = self._distill_bce(zb, p_t, T)
+        # kl_h = self._distill_bce(zb, p_h, T)
+        # kl_t = self._distill_bce(zb, p_t, T)
+        kl_h = self._distill_bce(zb_slp, p_h, T)
+        kl_t = self._distill_bce(zb_slp, p_t, T)
 
         with torch.no_grad():
             lh = self.criterion_cls(zhat_h, label)
@@ -303,7 +340,6 @@ class CxrModel3(pl.LightningModule):
             "label": label,
         }
 
-    # Lightning hooks (너가 요구한 형식 유지)
     def training_step(self, batch, batch_idx):
         res = self.shared_step(batch, batch_idx, phase='train')
         self.log_dict({"loss": res["loss"].detach()}, prog_bar=True)
@@ -360,3 +396,4 @@ class CxrModel3(pl.LightningModule):
         opt = SGD(self.parameters(), lr=self.lr, momentum=0.9, weight_decay=self.weight_decay, nesterov=True)
         sch = get_cosine_schedule_with_warmup(opt, self.warmup_steps, self.total_steps)
         return [opt], [{"scheduler": sch, "interval": "step"}]
+    

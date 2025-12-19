@@ -34,6 +34,42 @@ class Backbone(nn.Module):
         fvec  = feats.mean(dim=[2, 3])     # [B, 768]  ← SLP 통계용
         return logits, fvec
 
+
+class SingleViewBackboneCOMIC(nn.Module):
+    """
+    Stage1: layer 구조는 Backbone(ConvNeXt -> PosEnc) 그대로
+            + MLDecoder head 3개만 붙임 (h/t/b)
+    반환:
+      zh, zt, zb: [B, C]
+      x_trans:    [B, L, 768]  (PosEnc feature를 token으로 펼친 것)
+      mask:       [B, L] (False)
+    """
+    def __init__(self, timm_init_args, num_classes=26, dim=768):
+        super().__init__()
+        self.model = timm.create_model(**timm_init_args)
+        self.model.head = nn.Identity()  # feature map 뽑기 (Backbone과 동일)
+
+        self.pos_encoding = Summer(PositionalEncoding2D(dim))
+
+        # MLDecoder 3개만 추가
+        self.head_h = MLDecoder(num_classes=num_classes, initial_num_features=dim)
+        self.head_t = MLDecoder(num_classes=num_classes, initial_num_features=dim)
+        self.head_b = MLDecoder(num_classes=num_classes, initial_num_features=dim)
+
+    def forward(self, x):
+        # feats: [B,768,Hf,Wf]
+        feats = self.model(x)
+        feats_pos = self.pos_encoding(feats)
+
+        # MLDecoder가 [B,C,H,W]도 받는 기존 네 Backbone 방식 그대로
+        zh = self.head_h(feats_pos)
+        zt = self.head_t(feats_pos)
+        zb = self.head_b(feats_pos)
+
+        fvec = feats.mean(dim=[2, 3])  # [B,768]
+        return zh, zt, zb, fvec
+    
+    
 class FusionBackbone(nn.Module):
     def __init__(self, timm_init_args, pretrained_path=None):
         super().__init__()

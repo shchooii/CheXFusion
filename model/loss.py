@@ -605,19 +605,19 @@ def _assert_finite(x, where):
 class ResampleLoss2(nn.Module):
 
     def __init__(self,
-                 class_instance_nums,
-                 total_instance_num,
+                 class_instance_nums=pos_counts,
+                 total_instance_num=N_total,
                  up_mult=9,dw_mult=9,
                  use_sigmoid=True,
                  reduction='mean',
                  loss_weight=1.0,
                  partial=False,
-                 focal=dict(
-                    focal=False,
-                    mode='focal',
-                    gamma=2,
-                    balance_param=2.0
-                ),
+                #  focal=dict(
+                #     focal=False,
+                #     mode='focal',
+                #     gamma=2,
+                #     balance_param=2.0
+                # ),
                 #  focal=dict(
                 #     focal=True,
                 #     mode='asl',
@@ -649,16 +649,16 @@ class ResampleLoss2(nn.Module):
                 #     lamb=1.5,
                 #     balance_param=1.0
                 # ),
-                # focal=dict(
-                #     focal=True,
-                #     mode='mfm',
-                #     gamma_neg=4,
-                #     gamma_pos=0,
-                #     clip=0.05,
-                #     balance_param=1.0,
-                #     gamma_class_ng=1.2,
-                #     gamma_class_pos=1.0
-                # ),
+                focal=dict(
+                    focal=True,
+                    mode='mfm',
+                    gamma_neg=4,
+                    gamma_pos=0,
+                    clip=0.05,
+                    balance_param=1.0,
+                    gamma_class_ng=1.2,
+                    gamma_class_pos=1.0
+                ),
                  CB_loss=dict(
                      CB_beta=0.99,
                      CB_mode='average_w'  # 'by_class', 'average_n', 'average_w', 'min_n'
@@ -668,9 +668,10 @@ class ResampleLoss2(nn.Module):
                      beta=7.0,
                      gamma=0.25
                  ),
+                 # 수정 init bias 1.0
                  logit_reg=dict(
                      neg_scale=1.0,
-                     init_bias=1.0
+                     init_bias=0.0
                  ),
                  coef_param=dict(
                       coef_alpha=1.0 / 3.0,
