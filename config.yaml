@@ -19,7 +19,7 @@ trainer:
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: save/COMICst0103
+        dirpath: save/COMICst0108
         filename: '{epoch:02d}-{val_loss:.4f}-{val_ap:.5f}'
         save_top_k: 10
         monitor: val_loss
@@ -102,7 +102,7 @@ model:
   - Support Devices
   - Tortuous Aorta
   loss_init_args:
-    type: mfm
+    type: wasl
     class_instance_nums:
       - 67597
       - 4361

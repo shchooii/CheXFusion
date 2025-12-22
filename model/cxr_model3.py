@@ -11,6 +11,21 @@ from model.estimator import EstimatorCV
 from model.layers import FusionBackbone2, SingleViewBackboneCOMIC
 
 
+def linear_ramp(step: int, start: int, end: int) -> float:
+    """
+    step: current global step
+    start: ramp 시작 step (이전엔 0)
+    end: ramp 끝 step (이후엔 1)
+    """
+    if end <= start:
+        return 1.0
+    if step <= start:
+        return 0.0
+    if step >= end:
+        return 1.0
+    return float(step - start) / float(end - start)
+
+
 # =========================================================
 # Eq.(8) Additive Attention Block (성능형 구성)
 #   f_b = Attn(f_hat_b, [f_h, f_t]) + f_hat_b
@@ -60,24 +75,26 @@ class CxrModel3(pl.LightningModule):
         loss_init_args,
         timm_init_args,
 
-        lambda_b: float = 0.2,
-        lambda_irm: float = 1e-3,
+        lambda_b: float = 0.1,
+        lambda_irm: float = 1e-4,
 
         mu: float = 0.9,
         alpha: float = 2.0,
         temperature: float = 2.0,
 
         # Eq.9/10 params
-        rho: float = 0.2,
+        rho: float = 0.05,
         eta: float = 1e-6,
         Ng: int = 1,                  # 기본값, 아래에서 head별로 override 가능
 
         # Eq.9 strength
-        plm_gamma: float = 1.0,       # Eq.(9) term을 얼마나 세게 섞을지 (빡세게=1.0부터)
+        plm_gamma: float = 0.1,       # Eq.(9) term을 얼마나 세게 섞을지 (빡세게=1.0부터)
 
         weight_decay: float = 1e-4,
         warmup_steps: int = 0,
         total_steps: int = 250000,
+        irm_ramp_start: int = 20000,
+        irm_ramp_end: int = 60000,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["classes"])
@@ -86,12 +103,6 @@ class CxrModel3(pl.LightningModule):
         
         # Stage 1
         self.backbone = SingleViewBackboneCOMIC(timm_init_args=timm_init_args)
-        
-        # Stage 2
-        # self.backbone = FusionBackbone2(
-        #     timm_init_args=timm_init_args,
-        #     pretrained_path="export/convnext_stage1_for_fusion2.pth",
-        # )
 
         self.criterion_cls = get_loss(**loss_init_args)
         self.irm_base = nn.BCEWithLogitsLoss(reduction="mean")
@@ -109,8 +120,8 @@ class CxrModel3(pl.LightningModule):
         self.Ng = max(int(Ng), 1)
         self.plm_gamma = float(plm_gamma)
         
-        # -------- Eq.(8) env feature 분리 (projection) --------
-        # backbone 공유 + projection만 분리 (현실적인 논문 구현 방향)
+        # # -------- Eq.(8) env feature 분리 (projection) --------
+        # # backbone 공유 + projection만 분리 (현실적인 논문 구현 방향)
         self.proj_h = nn.Sequential(nn.LayerNorm(768), nn.Linear(768, 768, bias=False))
         self.proj_t = nn.Sequential(nn.LayerNorm(768), nn.Linear(768, 768, bias=False))
         self.proj_b = nn.Sequential(nn.LayerNorm(768), nn.Linear(768, 768, bias=False))
@@ -126,12 +137,15 @@ class CxrModel3(pl.LightningModule):
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
         self.total_steps = total_steps
+        self.irm_ramp_start = int(irm_ramp_start)
+        self.irm_ramp_end = int(irm_ramp_end)
         
-        # SLP
-        self.cv_h = EstimatorCV(feature_num=768, class_num=len(classes))
-        self.cv_t = EstimatorCV(feature_num=768, class_num=len(classes))
-        self.cv_b = EstimatorCV(feature_num=768, class_num=len(classes))
-        self.resample_loss = ResampleLoss2()
+        # # SLP
+        # self.cv_h = EstimatorCV(feature_num=768, class_num=len(classes))
+        # self.cv_t = EstimatorCV(feature_num=768, class_num=len(classes))
+        # self.cv_b = EstimatorCV(feature_num=768, class_num=len(classes))
+        # self.resample_loss = ResampleLoss2()
+        
 
     # -------------------------
     # pool feature
@@ -211,101 +225,183 @@ class CxrModel3(pl.LightningModule):
 
     def forward(self, image):
         return self.backbone(image)
-
+    
+    
     # =========================================================
-    # shared_step
+    # A0) BASELINE: No COMIC
+    #   - loss = cls(zb_raw)
+    #   - pred = zb_raw
     # =========================================================
-    def shared_step(self, batch, batch_idx, phase: str):
+    def shared_step_A0(self, batch, batch_idx, phase: str):
         image, label = batch
-
-        # backbone raw logits + token features
         zh_raw, zt_raw, zb_raw, f_base = self(image)
-        # zh_raw, zt_raw, zb_raw, x_trans, mask = self(image)
 
-        # -----------------------------
-        # Eq.(8) env features
-        # # -----------------------------
-        # f_base = self._mean_pool_feature(x_trans, mask) # [B,768]
+        loss_cls = self.criterion_cls(zb_raw, label)
+        loss_htb = zb_raw.new_tensor(0.0)
+        loss_irm = zb_raw.new_tensor(0.0)
+
+        loss = loss_cls
+        pred = torch.sigmoid(zb_raw).detach()
+
+        return {
+            "loss": loss,
+            "loss_cls": loss_cls.detach(),
+            "loss_htb": loss_htb.detach(),
+            "loss_irm": loss_irm.detach(),
+            "pred": pred,
+            "label": label,
+        }
+    
+    # =========================================================
+    # A1) HTB ONLY (teacher=RAW)
+    #   - env/plm/eq10/et/irm 모두 off
+    #   - teacher: zh_raw, zt_raw
+    #   - loss = cls(zb_raw) + lambda_b_eff * htb(zb_raw <- teacher_raw)
+    # =========================================================
+    def shared_step_A1(self, batch, batch_idx, phase: str):
+        image, label = batch
+        zh_raw, zt_raw, zb_raw, f_base = self(image)
+
+        # cls (student)
+        loss_cls = self.criterion_cls(zb_raw, label)
+
+        # HTB (teacher=raw)
+        T = self.temperature
+        p_h = torch.sigmoid(zh_raw / T).detach()
+        p_t = torch.sigmoid(zt_raw / T).detach()
+
+        kl_h = self._distill_bce(zb_raw, p_h, T)
+        kl_t = self._distill_bce(zb_raw, p_t, T)
+
+        with torch.no_grad():
+            lh = self.criterion_cls(zh_raw, label)
+            lt = self.criterion_cls(zt_raw, label)
+            a = self.alpha
+            denom = (lh ** a) + (lt ** a) + 1e-8
+            wh = (lh ** a) / denom
+            wt = (lt ** a) / denom
+
+        loss_htb = wh * kl_h + wt * kl_t
+
+        # # ramp for lambda_b
+        # b = linear_ramp(self.global_step, 40000, 100000)
+        # lambda_b_eff = self.lambda_b * b
+
+        loss_irm = zb_raw.new_tensor(0.0)
+        loss = loss_cls + self.lambda_b * loss_htb
+
+        pred = torch.sigmoid(zb_raw).detach()
+        return {
+            "loss": loss,
+            "loss_cls": loss_cls.detach(),
+            "loss_htb": loss_htb.detach(),
+            "loss_irm": loss_irm.detach(),
+            "pred": pred,
+            "label": label,
+        }
+        
+    
+    # =========================================================
+    # A2) PLM ONLY (Eq8 + Eq9 + et update만)
+    #   - cls 학습은 "항상" zb_raw로만 (student 고정)
+    #   - Eq9로 만든 zb는 loss_for_et에만 사용해서 et 업데이트 그래프 연결
+    #   - HTB/IRM/Eq10 모두 off
+    # =========================================================
+    def shared_step_A2(self, batch, batch_idx, phase: str):
+        image, label = batch
+        zh_raw, zt_raw, zb_raw, f_base = self(image)
+
+        # Eq8 env
         f_h = self.proj_h(f_base)
         f_t = self.proj_t(f_base)
         f_hat_b = self.proj_b(f_base)
-        f_b = self.env_attn(f_hat_b, f_h, f_t)        # [B,768]  (Eq.8)
+        f_b = self.env_attn(f_hat_b, f_h, f_t)
 
-        # -----------------------------
-        # ✅ Eq.(9) logits (PLM term)
-        # -----------------------------
-        z9_h = self._logit_eq9(f_h, self.backbone.head_h)      # [B,C]
-        z9_t = self._logit_eq9(f_t, self.backbone.head_t)      # [B,C]
-        z9_b = self._logit_eq9(f_b, self.backbone.head_b)      # [B,C]
+        # Eq9 PLM
+        z9_h = self._logit_eq9(f_h, self.backbone.head_h)
+        z9_t = self._logit_eq9(f_t, self.backbone.head_t)
+        z9_b = self._logit_eq9(f_b, self.backbone.head_b)
 
-        # raw logits와 결합 (Eq.9 “빡세게 살림”)
         zh = zh_raw + self.plm_gamma * z9_h
         zt = zt_raw + self.plm_gamma * z9_t
         zb = zb_raw + self.plm_gamma * z9_b
-        
-        # -----------------------------
-        # main loss (balanced)
-        # -----------------------------
-        loss_cls = self.criterion_cls(zb, label)
-        # SLP
-        stats_b = self.cv_b.update_CV(f_b, label, zb.detach())
-        B, C = zb.shape
-        zb_exp = zb.view(B, C, 1).expand(B, C, C).clone()
-        label_exp = label.view(B, C, 1).expand(B, C, C).clone()
-        zb_slp = zb + self.resample_loss.lpl_imbalance(zb_exp, label_exp, *stats_b).mean(dim=2)
-        loss_cls = self.resample_loss(*stats_b, zb_slp, label)
 
-        # -----------------------------
-        # Eq.(7) e_t update
-        # -----------------------------
-        # stage 1 버전
+        # cls (student는 raw 고정)
+        loss_cls = self.criterion_cls(zb_raw, label)
+
+        # et update용 loss (graph 연결 보장)
+        loss_for_et = self.criterion_cls(zb, label)
+
         if phase == "train":
-            g = torch.autograd.grad(loss_cls, f_hat_b, retain_graph=True, create_graph=False)[0]  # [B,768]
+            g = torch.autograd.grad(loss_for_et, f_hat_b, retain_graph=True, create_graph=False)[0]
             self.et.mul_(self.mu).add_(g.sum(dim=0).detach())
-
-            # 폭주 클립(실전 안정화)
             n = self.et.norm()
             if n > 1e3:
                 self.et.mul_(1e3 / (n + 1e-6))
-        
-        # stage 2 버전
-        # if phase == "train": 
-        #     grad_x = torch.autograd.grad(loss_cls, x_trans, retain_graph=True, create_graph=False)[0] 
-        #     grad_base = self._mean_pool_feature(grad_x, mask) # [B,768] 
-        #     grad_fb = self.proj_b(grad_base).detach() # [B,768] 
-        #     self.et.mul_(self.mu).add_(grad_fb.sum(dim=0)) 
-            
-        #     # 폭주 클립(실전 안정화) 
-        #     n = self.et.norm() 
-        #     if n > 1e3: 
-        #         self.et.mul_(1e3 / (n + 1e-6))
 
-        # -----------------------------
-        # Eq.(10) head/tail logit adjustment
-        #   - sim은 Eq.(8)의 f_b 기준으로 두는 게 일관적
-        # -----------------------------
+        loss_htb = zb_raw.new_tensor(0.0)
+        loss_irm = zb_raw.new_tensor(0.0)
+
+        loss = loss_cls
+        pred = torch.sigmoid(zb_raw).detach()
+        return {
+            "loss": loss,
+            "loss_cls": loss_cls.detach(),
+            "loss_htb": loss_htb.detach(),
+            "loss_irm": loss_irm.detach(),
+            "pred": pred,
+            "label": label,
+        }
+    
+    # =========================================================
+    # A3) FULL TEACHER COMIC (Eq8 + Eq9 + Eq10 + HTB + IRM)
+    #   - cls 학습은 zb_raw 고정 (student 유지)
+    #   - teacher는 zhat_h/zhat_t (Eq9+Eq10 적용)
+    #   - et update는 loss_for_et(=criterion(zb,label))로 연결
+    #   - IRM은 raw logits에 + ramp
+    # =========================================================
+    def shared_step_A3(self, batch, batch_idx, phase: str):
+        image, label = batch
+        zh_raw, zt_raw, zb_raw, f_base = self(image)
+
+        # Eq8 env
+        f_h = self.proj_h(f_base)
+        f_t = self.proj_t(f_base)
+        f_hat_b = self.proj_b(f_base)
+        f_b = self.env_attn(f_hat_b, f_h, f_t)
+
+        # Eq9 PLM
+        z9_h = self._logit_eq9(f_h, self.backbone.head_h)
+        z9_t = self._logit_eq9(f_t, self.backbone.head_t)
+        z9_b = self._logit_eq9(f_b, self.backbone.head_b)
+
+        zh = zh_raw + self.plm_gamma * z9_h
+        zt = zt_raw + self.plm_gamma * z9_t
+        zb = zb_raw + self.plm_gamma * z9_b
+
+        # cls (student raw)
+        loss_cls = self.criterion_cls(zb_raw, label)
+
+        # et update용 loss (graph 연결)
+        loss_for_et = self.criterion_cls(zb, label)
+        if phase == "train":
+            g = torch.autograd.grad(loss_for_et, f_hat_b, retain_graph=True, create_graph=False)[0]
+            self.et.mul_(self.mu).add_(g.sum(dim=0).detach())
+            n = self.et.norm()
+            if n > 1e3:
+                self.et.mul_(1e3 / (n + 1e-6))
+
+        # Eq10 (teacher quality)
         zhat_h = self._logit_adjust_eq10(zh, self.backbone.head_h, f_b, sign=+1.0)
         zhat_t = self._logit_adjust_eq10(zt, self.backbone.head_t, f_b, sign=-1.0)
-        
-        # SLP
-        stats_h = self.cv_h.update_CV(f_h, label, zh.detach())
-        stats_t = self.cv_t.update_CV(f_t, label, zt.detach())
-        zh_exp = zhat_h.view(B, C, 1).expand(B, C, C).clone()
-        zt_exp = zhat_t.view(B, C, 1).expand(B, C, C).clone()
-        zhat_h = zhat_h + self.resample_loss.lpl_imbalance(zh_exp, label_exp, *stats_h).mean(dim=2)
-        zhat_t = zhat_t + self.resample_loss.lpl_imbalance(zt_exp, label_exp, *stats_t).mean(dim=2)
 
-        # -----------------------------
-        # Eq.(11) HTB
-        # -----------------------------
+        # HTB (teacher = zhat)
         T = self.temperature
         p_h = torch.sigmoid(zhat_h / T).detach()
         p_t = torch.sigmoid(zhat_t / T).detach()
 
-        # kl_h = self._distill_bce(zb, p_h, T)
-        # kl_t = self._distill_bce(zb, p_t, T)
-        kl_h = self._distill_bce(zb_slp, p_h, T)
-        kl_t = self._distill_bce(zb_slp, p_t, T)
+        kl_h = self._distill_bce(zb_raw, p_h, T)
+        kl_t = self._distill_bce(zb_raw, p_t, T)
 
         with torch.no_grad():
             lh = self.criterion_cls(zhat_h, label)
@@ -317,19 +413,20 @@ class CxrModel3(pl.LightningModule):
 
         loss_htb = wh * kl_h + wt * kl_t
 
-        # -----------------------------
-        # IRM
-        # -----------------------------
+        # IRM (raw logits에 적용 + ramp)
         if self.lambda_irm > 0 and phase == "train":
-            loss_irm = self._irm_loss(zh, zt, zb, label)
+            r = linear_ramp(self.global_step, self.irm_ramp_start, self.irm_ramp_end)
+            lam_irm = self.lambda_irm * r
+            loss_irm = self._irm_loss(zh_raw, zt_raw, zb_raw, label) * lam_irm
         else:
-            loss_irm = zb.new_tensor(0.0)
+            loss_irm = zb_raw.new_tensor(0.0)
 
-        # -----------------------------
-        # total
-        # -----------------------------
-        loss = loss_cls + self.lambda_b * loss_htb + self.lambda_irm * loss_irm
-        pred = torch.sigmoid(zb).detach()
+        # ramp for lambda_b
+        # b = linear_ramp(self.global_step, 40000, 100000)
+        # lambda_b_eff = self.lambda_b * b
+
+        loss = loss_cls + self.lambda_b * loss_htb + loss_irm
+        pred = torch.sigmoid(zb_raw).detach()
 
         return {
             "loss": loss,
@@ -339,6 +436,118 @@ class CxrModel3(pl.LightningModule):
             "pred": pred,
             "label": label,
         }
+
+    def shared_step(self, batch, batch_idx, phase: str):
+        # return self.shared_step_A0(batch, batch_idx, phase)
+        # return self.shared_step_A1(batch, batch_idx, phase)
+        # return self.shared_step_A2(batch, batch_idx, phase)
+        return self.shared_step_A3(batch, batch_idx, phase)
+
+    # # =========================================================
+    # # shared_step
+    # # =========================================================
+    # def shared_step(self, batch, batch_idx, phase: str):
+    #     image, label = batch
+
+    #     # backbone raw logits + token features
+    #     zh_raw, zt_raw, zb_raw, f_base = self(image)
+
+    #     # -----------------------------
+    #     # Eq.(8) env features
+    #     # # -----------------------------
+    #     f_h = self.proj_h(f_base)
+    #     f_t = self.proj_t(f_base)
+    #     f_hat_b = self.proj_b(f_base)
+    #     f_b = self.env_attn(f_hat_b, f_h, f_t)        # [B,768]  (Eq.8)
+
+    #     # # -----------------------------
+    #     # # ✅ Eq.(9) logits (PLM term)
+    #     # # -----------------------------
+    #     z9_h = self._logit_eq9(f_h, self.backbone.head_h)      # [B,C]
+    #     z9_t = self._logit_eq9(f_t, self.backbone.head_t)      # [B,C]
+    #     z9_b = self._logit_eq9(f_b, self.backbone.head_b)      # [B,C]
+
+    #     r_plm = linear_ramp(self.global_step, 40000, 120000)
+    #     gamma = self.plm_gamma * r_plm
+    #     zh = zh_raw + gamma * z9_h
+    #     zt = zt_raw + gamma * z9_t
+    #     zb = zb_raw + gamma * z9_b
+        
+    #     # -----------------------------
+    #     # main loss (balanced)
+    #     # -----------------------------
+    #     loss_cls = self.criterion_cls(zb_raw, label)
+    #     loss_for_et = self.criterion_cls(zb, label)
+
+    #     # -----------------------------
+    #     # Eq.(7) e_t update
+    #     # -----------------------------
+    #     # stage 1 버전
+    #     if phase == "train":
+    #         g = torch.autograd.grad(loss_for_et, f_hat_b, retain_graph=True, create_graph=False)[0]  # [B,768]
+    #         self.et.mul_(self.mu).add_(g.sum(dim=0).detach())
+
+    #         # 폭주 클립(실전 안정화)
+    #         n = self.et.norm()
+    #         if n > 1e3:
+    #             self.et.mul_(1e3 / (n + 1e-6))
+        
+    #     # -----------------------------
+    #     # Eq.(10) head/tail logit adjustment
+    #     #   - sim은 Eq.(8)의 f_b 기준으로 두는 게 일관적
+    #     # -----------------------------
+    #     zhat_h = self._logit_adjust_eq10(zh, self.backbone.head_h, f_b, sign=+1.0)
+    #     zhat_t = self._logit_adjust_eq10(zt, self.backbone.head_t, f_b, sign=-1.0)
+
+    #     # -----------------------------
+    #     # Eq.(11) HTB
+    #     # -----------------------------
+    #     T = self.temperature
+    #     p_h = torch.sigmoid(zhat_h / T).detach()
+    #     p_t = torch.sigmoid(zhat_t / T).detach()
+
+    #     kl_h = self._distill_bce(zb_raw, p_h, T)
+    #     kl_t = self._distill_bce(zb_raw, p_t, T)
+    #     # kl_h = self._distill_bce(zb_slp, p_h, T)
+    #     # kl_t = self._distill_bce(zb_slp, p_t, T)
+
+    #     with torch.no_grad():
+    #         lh = self.criterion_cls(zhat_h, label)
+    #         lt = self.criterion_cls(zhat_t, label)
+    #         a = self.alpha
+    #         denom = (lh ** a) + (lt ** a) + 1e-8
+    #         wh = (lh ** a) / denom
+    #         wt = (lt ** a) / denom
+
+    #     loss_htb = wh * kl_h + wt * kl_t
+
+    #     # -----------------------------
+    #     # IRM
+    #     # -----------------------------
+    #     if self.lambda_irm > 0 and phase == "train":
+    #         r = linear_ramp(self.global_step, self.irm_ramp_start, self.irm_ramp_end)
+    #         lam_irm = self.lambda_irm * r
+    #         loss_irm = self._irm_loss(zh_raw, zt_raw, zb_raw, label) * lam_irm
+    #     else:
+    #         loss_irm = zb.new_tensor(0.0)
+            
+    #     b = linear_ramp(self.global_step, 40000, 100000)
+    #     lambda_b_eff = self.lambda_b * b
+
+    #     # -----------------------------
+    #     # total
+    #     # -----------------------------
+    #     loss = loss_cls + lambda_b_eff * loss_htb + loss_irm
+    #     pred = torch.sigmoid(zb_raw).detach()
+
+    #     return {
+    #         "loss": loss,
+    #         "loss_cls": loss_cls.detach(),
+    #         "loss_htb": loss_htb.detach(),
+    #         "loss_irm": loss_irm.detach(),
+    #         "pred": pred,
+    #         "label": label,
+    #     }
 
     def training_step(self, batch, batch_idx):
         res = self.shared_step(batch, batch_idx, phase='train')
